@@ -1,0 +1,243 @@
+# https://docs.gitlab.com/ci/yaml/
+
+# Default image for linux builds
+# This should match the image used to build the JVM database libraries (so Address Sanitizer library matches)
+image: objectboxio/buildenv-core:2024-07-11 # With JDK 17
+
+# Assumes these environment variables are configured in GitLab CI/CD Settings:
+# - OBX_READ_PACKAGES_TOKEN
+# - SONATYPE_USER
+# - SONATYPE_PWD
+# - GOOGLE_CHAT_WEBHOOK_JAVA_CI
+# Additionally, these environment variables used by the objectbox-publish Gradle script:
+# - ORG_GRADLE_PROJECT_signingKeyFile
+# - ORG_GRADLE_PROJECT_signingKeyId
+# - ORG_GRADLE_PROJECT_signingPassword
+
+variables:
+  OBX_RELEASE:
+    value: "false"
+    options: [ "false", "true" ]
+    description: "Turns on the release flag in the Gradle root build script, which triggers building and publishing a
+                  release of Java libraries to the internal GitLab repository and Maven Central.
+                  Consult the release checklist before turning this on."
+
+  # Disable the Gradle daemon. Gradle may run in a Docker container with a shared
+  # Docker volume containing GRADLE_USER_HOME. If the container is stopped after a job
+  # Gradle daemons may get killed, preventing proper clean-up of lock files in GRADLE_USER_HOME.
+  # Use low priority processes to avoid Gradle builds consuming all build machine resources.
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.priority=low"
+  GITLAB_REPO_ARGS: "-PgitlabUrl=$CI_SERVER_URL -PgitlabPrivateTokenName=Deploy-Token -PgitlabPrivateToken=$OBX_READ_PACKAGES_TOKEN"
+  GITLAB_PUBLISH_ARGS: "-PgitlabPublishTokenName=Job-Token -PgitlabPublishToken=$CI_JOB_TOKEN"
+  CENTRAL_PUBLISH_ARGS: "-PsonatypeUsername=$SONATYPE_USER -PsonatypePassword=$SONATYPE_PWD"
+  # CI_COMMIT_REF_SLUG is the branch or tag name, but web-safe (only 0-9, a-z)
+  VERSION_ARGS: "-PversionPostFix=$CI_COMMIT_REF_SLUG"
+
+# Using multiple test stages to avoid running some things in parallel (see job notes).
+stages:
+  - test
+  - publish-maven-internal
+  - publish-maven-central
+  - package-api-docs
+  - triggers
+
+workflow:
+  rules:
+    # Disable merge request pipelines https://docs.gitlab.com/ci/jobs/job_rules/#ci_pipeline_source-predefined-variable
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    # Never create a pipeline when a tag is pushed (to simplify version computation in root build script)
+    - if: $CI_COMMIT_TAG
+      when: never
+    # In all other cases, create a pipeline
+    - when: always
+
+test:
+  stage: test
+  tags:
+    - docker
+    - linux
+    - x64
+  variables:
+    # Image defaults to POSIX (ASCII), set a compatible locale so UTF-8 tests that interact with the file system work.
+    # Check with 'locale -a' for available locales.
+    LC_ALL: "C.UTF-8"
+  before_script:
+    # Print Gradle and JVM version info
+    - ./gradlew -version
+    # Remove any previous JVM (Hotspot) crash log.
+    # "|| true" for an OK exit code if no file is found
+    - rm **/hs_err_pid*.log || true
+  script:
+    # build to assemble, run tests and spotbugs
+    # javadocForWeb to catch API docs errors before releasing
+    # Temporarily disable testing with Address Sanitizer until buildenv images are modernized, see #273
+    # - ./scripts/test-with-asan.sh $GITLAB_REPO_ARGS $VERSION_ARGS clean build javadocForWeb
+    - ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS clean build javadocForWeb
+  artifacts:
+    when: always
+    paths:
+      - "**/hs_err_pid*.log" # Only on JVM (Hotspot) crash.
+      - "**/build/reports/spotbugs/*.html"
+    reports:
+      junit: "**/build/test-results/**/TEST-*.xml"
+
+.test-template:
+  before_script:
+    # Print Gradle and JVM version info
+    - ./gradlew -version
+    # Remove any previous JVM (Hotspot) crash log.
+    # "|| true" for an OK exit code if no file is found
+    - rm **/hs_err_pid*.log || true
+  artifacts:
+    when: always
+    paths:
+      - "**/hs_err_pid*.log" # Only on JVM (Hotspot) crash.
+    reports:
+      junit: "**/build/test-results/**/TEST-*.xml"
+
+test-windows:
+  extends: .test-template
+  needs: ["test"]
+  tags:
+    - windows-jdk
+    - x64
+  script: ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS clean build
+
+test-macos:
+  extends: .test-template
+  needs: ["test"]
+  tags:
+    - jdk
+    - mac
+    - x64
+  script: ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS clean build
+
+# Address sanitizer is only available on Linux runners (see script).
+.test-asan-template:
+  extends: .test-template
+  tags:
+    - docker
+    - linux
+    - x64
+  variables:
+    # Image defaults to POSIX (ASCII), set a compatible locale so UTF-8 tests that interact with the file system work.
+    # Check with 'locale -a' for available locales.
+    LC_ALL: "C.UTF-8"
+  script:
+    # Note: do not run check task as it includes SpotBugs.
+    # Temporarily disable testing with Address Sanitizer until buildenv images are modernized, see #273
+    # - ./scripts/test-with-asan.sh $GITLAB_REPO_ARGS $VERSION_ARGS clean :tests:objectbox-java-test:test
+    - ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS clean :tests:objectbox-java-test:test
+
+# Test oldest supported and a recent JDK.
+# Note: can not run these in parallel using a matrix configuration as Gradle would step over itself.
+test-jdk-8:
+  extends: .test-asan-template
+  needs: ["test"]
+  variables:
+    TEST_JDK: 8
+
+# JDK 17 is the default of the current build image, so test the latest LTS JDK 21
+test-jdk-21:
+  extends: .test-asan-template
+  needs: ["test-jdk-8"]
+  variables:
+    TEST_JDK: 21
+
+test-jdk-x86:
+  extends: .test-template
+  needs: ["test-windows"]
+  tags:
+    - windows-jdk
+    - x64
+  variables:
+    # TEST_WITH_JAVA_X86 makes objectbox-java-test use 32-bit java executable and therefore
+    # 32-bit ObjectBox to run tests (see build.gradle file).
+    # Note: assumes JAVA_HOME_X86 is set to 32-bit JDK path.
+    TEST_WITH_JAVA_X86: "true"
+  script: ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS clean build
+
+# Publish Maven artifacts to internal Maven repo
+publish-maven-internal:
+  stage: publish-maven-internal
+  tags:
+    - docker
+    - linux
+    - x64
+  rules:
+    # Not for main branch, doing so may duplicate release artifacts (uploaded from publish branch)
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    # Not if triggered by upstream project to save on disk space
+    - if: $CI_PIPELINE_SOURCE == "pipeline"
+      when: never
+    # Not for scheduled pipelines to save on disk space
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    # Otherwise, only if no previous stages failed
+    - when: on_success
+  script:
+    - ./gradlew $GITLAB_REPO_ARGS $GITLAB_PUBLISH_ARGS $VERSION_ARGS publishMavenJavaPublicationToGitLabRepository
+
+# Publish Maven artifacts to public Maven Central repo
+publish-maven-central:
+  stage: publish-maven-central
+  tags:
+    - docker
+    - linux
+    - x64
+  rules:
+    # Only if release mode is on, only if no previous stages failed
+    - if: $OBX_RELEASE == "true"
+      when: on_success
+  before_script:
+    - ci/send-to-gchat.sh "$GOOGLE_CHAT_WEBHOOK_JAVA_CI" --thread $CI_COMMIT_SHA "*Releasing Java library:* job $CI_JOB_NAME from branch $CI_COMMIT_BRANCH ($CI_COMMIT_SHORT_SHA)..."
+  script:
+    # Note: supply internal repo as tests use native dependencies that might not be published, yet.
+    - ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS $CENTRAL_PUBLISH_ARGS publishMavenJavaPublicationToSonatypeRepository closeAndReleaseSonatypeStagingRepository
+  after_script:
+    # Also runs on failure, so show CI_JOB_STATUS.
+    - ci/send-to-gchat.sh "$GOOGLE_CHAT_WEBHOOK_JAVA_CI" --thread $CI_COMMIT_SHA "*Releasing Java library:* *$CI_JOB_STATUS* for $CI_JOB_NAME"
+    - ci/send-to-gchat.sh "$GOOGLE_CHAT_WEBHOOK_JAVA_CI" --thread $CI_COMMIT_SHA "Check https://repo1.maven.org/maven2/io/objectbox/ in a few minutes."
+
+# Create Java API docs archive
+package-api-docs:
+  stage: package-api-docs
+  tags:
+    - docker
+    - linux
+    - x64
+  rules:
+    # Only if release mode is on, only if no previous stages failed
+    - if: $OBX_RELEASE == "true"
+      when: on_success
+  script:
+    - ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS :objectbox-java:packageJavadocForWeb
+  after_script:
+    - ci/send-to-gchat.sh "$GOOGLE_CHAT_WEBHOOK_JAVA_CI" --thread $CI_COMMIT_SHA "API docs for web available as job artifact $CI_JOB_URL"
+  artifacts:
+    paths:
+      - "objectbox-java/build/dist/objectbox-java-web-api-docs.zip"
+
+# Trigger Gradle plugin build to test new Maven snapshots of this project
+trigger-plugin:
+  stage: triggers
+  rules:
+    # Not when publishing a release
+    - if: $OBX_RELEASE == "true"
+      when: never
+    # Do not trigger publishing of plugin
+    - if: $CI_COMMIT_BRANCH == "publish"
+      when: never
+    # Not for scheduled pipelines where Maven snapshots of this project do not change
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    # Otherwise, only if no previous stages failed. Also set allow_failure in case branch does not exist downstream.
+    - when: on_success
+  inherit:
+    variables: false
+  allow_failure: true # Branch might not exist in plugin project
+  trigger:
+    project: objectbox/objectbox-plugin
+    branch: $CI_COMMIT_BRANCH

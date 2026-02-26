@@ -1,0 +1,7 @@
+objectbox-model.json
+objectbox-model.go
+objectbox-model.[ch]
+
+*.obx.go
+*.obx.[ch]
+*.obx.[ch]pp

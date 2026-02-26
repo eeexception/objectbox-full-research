@@ -1,0 +1,13 @@
+# Generated files
+CMakeLists.txt
+objectbox-model.json
+objectbox-model.[ch]
+*.obx.[ch]
+*.obx.[ch]pp
+
+# IDE
+.idea/
+*.iml
+.vscode
+.vs/
+cmake-build*/
