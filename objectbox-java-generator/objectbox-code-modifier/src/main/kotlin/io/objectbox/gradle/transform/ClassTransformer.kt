@@ -28,6 +28,7 @@ import javassist.CtConstructor
 import javassist.CtField
 import javassist.Modifier
 import javassist.NotFoundException
+import javassist.bytecode.AccessFlag
 import javassist.bytecode.Descriptor
 import javassist.bytecode.Opcode
 import javassist.bytecode.SignatureAttribute
@@ -47,6 +48,21 @@ class ClassTransformer(private val debug: Boolean = false) {
         val ctByProbedClass = mutableMapOf<ProbedClass, CtClass>()
         val entityTypes: Set<String> = probedClasses.filter { it.isEntity }.map { it.name }.toHashSet()
         val stats = ClassTransformerStats()
+
+        /**
+         * Bridge from entity-phase to cursor-phase for `@Embedded` hydration. Populated during
+         * [transformEntity] (after synthetic flat-fields are injected onto the entity class),
+         * consumed during [transformCursor] (to build the `attachEmbedded()` body). Keyed by
+         * entity FQN — the cursor looks up its entity type from the `attachEmbedded(L<Entity>;)V`
+         * signature descriptor, same trick as `checkEntityIsInClassPool()`.
+         *
+         * Why stash here rather than re-discovering in the cursor phase? Re-discovery would mean
+         * walking the entity's `@Embedded` annotations twice (once per phase), loading the container
+         * CtClass twice, resolving the prefix twice. None of that is expensive, but doing it twice
+         * means two places where naming-rule drift could hide. Single discovery + stash → single
+         * source of truth per build.
+         */
+        val embeddedContainersByEntity = mutableMapOf<String, List<EmbeddedTransform.EmbeddedContainer>>()
 
         init {
             // Notes:
@@ -190,6 +206,28 @@ class ClassTransformer(private val debug: Boolean = false) {
         val hasRelations = entityClass.hasRelation(context.entityTypes)
         if (debug) log("Checking to transform \"${ctClass.name}\" (has relations: $hasRelations)")
         var changed = checkBoxStoreField(ctClass, context, hasRelations)
+
+        // ── @Embedded: inject synthetic flat-fields so JNI can set them on reads ────────────
+        // Gated on `ctClass == ctClassEntity` — i.e. only on the concrete @Entity leaf, not on
+        // @BaseEntity ancestors. This mirrors the relation-in-superclass restriction above
+        // (L136-143) without duplicating the rejection: APT should already have rejected
+        // @Embedded on a @BaseEntity, so we simply don't process it here. If a user somehow
+        // bypasses APT, the synthetic fields never land → JNI's PUTFIELD fails at runtime
+        // with a NoSuchFieldError — loud enough to diagnose.
+        //
+        // Metadata discovered here is stashed on the Context for the cursor phase to consume
+        // when building the `attachEmbedded()` body. Entity transforms ALWAYS run before cursor
+        // transforms (see transformOrCopyClasses() ordering), so the stash is guaranteed populated
+        // by the time a cursor needs it.
+        if (entityClass.hasEmbeddedRef && ctClass == ctClassEntity) {
+            val containers = EmbeddedTransform.discoverEmbeddedContainers(context, ctClass, debug)
+            context.embeddedContainersByEntity[ctClassEntity.name] = containers
+            context.stats.embeddedContainersFound += containers.size
+            val added = EmbeddedTransform.injectEmbeddedSyntheticFields(ctClass, containers, debug)
+            context.stats.embeddedSyntheticFieldsAdded += added
+            if (added > 0) changed = true
+        }
+
         if (hasRelations) {
             val toOneFields =
                 findRelationFields(context, ctClassEntity, ctClass, ClassConst.toOneDescriptor, ClassConst.toOne)
@@ -411,7 +449,7 @@ class ClassTransformer(private val debug: Boolean = false) {
         context.probedClasses.filter { it.isCursor }.forEach { cursorClass ->
             val ctClass = makeCtClass(context, cursorClass)
             try {
-                if (transformCursor(ctClass, cursorClass.outDir, context.classPool)) {
+                if (transformCursor(context, ctClass, cursorClass.outDir)) {
                     context.transformedClasses.add(cursorClass)
                 }
             } catch (e: Exception) {
@@ -421,44 +459,166 @@ class ClassTransformer(private val debug: Boolean = false) {
     }
 
     /**
-     * Finds the attach method, checks its signature is as expected and warns if it
-     * does contain existing code. Then checks if the entity class does exist.
-     * Then transforms the attach method to add code assigning the BoxStore field
-     * added by the entity transformer. If the attach method already assigns the field,
-     * warns instead.
+     * Orchestrates per-cursor transforms. A cursor may have:
+     *
+     *   - `attachEntity(E)`    — relation wiring stub (emitted by `cursor.ftl` when the entity
+     *                            has relations but no `__boxStore` field). Transformer injects
+     *                            `$1.__boxStore = $0.boxStoreForEntities;`.
+     *   - `attachEmbedded(E?)` — @Embedded hydration stub (emitted by `cursor.ftl` when the
+     *                            entity has `@Embedded` fields). Transformer injects the full
+     *                            hydration body (null-guard + instantiate-copy-assign per container).
+     *
+     * Either, both, or neither may be present — they're orthogonal concerns gated by independent
+     * entity properties (`hasRelations` vs `hasEmbedded`). The writeFile() happens ONCE after all
+     * rewrites, so a cursor with both stubs gets a single coherent output rather than two
+     * sequential writes (the second of which would lose the first's edits, since writeFile
+     * serialises the in-memory CtClass state).
      */
-    private fun transformCursor(ctClass: CtClass, outDir: File, classPool: ClassPool): Boolean {
-        val attachCtMethod =
-            ctClass.declaredMethods?.singleOrNull { it.name == ClassConst.cursorAttachEntityMethodName }
-        if (attachCtMethod != null) {
-            val signature = attachCtMethod.signature
-            if (!signature.startsWith("(L") || !signature.endsWith(";)V") || signature.contains(',')) {
-                throw TransformException(
-                    "${ctClass.name} The signature of ${ClassConst.cursorAttachEntityMethodName} is not as expected, but was '$signature'."
-                )
-            }
-
-            val existingCode = attachCtMethod.methodInfo.codeAttribute.code
-            if (existingCode.size != 1 || existingCode[0] != Opcode.RETURN.toByte()) {
-                logWarning("${ctClass.name}.${ClassConst.cursorAttachEntityMethodName}  body expected to be empty, might lead to unexpected behavior.")
-            }
-
-            if (attachCtMethod.assignsBoxStoreField()) {
-                log(
-                    "${ctClass.name}.${ClassConst.cursorAttachEntityMethodName} assigns " +
-                            "${ClassConst.boxStoreFieldName}, make sure to read ${TextSnippet.URL_RELATIONS_INIT_MAGIC}."
-                )
-                return false // just copy, change nothing
-            }
-
-            checkEntityIsInClassPool(classPool, signature)
-
-            val code = "\$1.${ClassConst.boxStoreFieldName} = \$0.${ClassConst.cursorBoxStoreFieldName};"
-            attachCtMethod.insertAfter(code)
+    private fun transformCursor(context: Context, ctClass: CtClass, outDir: File): Boolean {
+        var changed = false
+        if (transformAttachEntity(ctClass, context.classPool)) changed = true
+        if (transformAttachEmbedded(context, ctClass)) changed = true
+        if (changed) {
             if (debug) log("Writing transformed cursor '${ctClass.name}'")
             ctClass.writeFile(outDir.absolutePath)
-            return true
-        } else return false
+        }
+        return changed
+    }
+
+    /**
+     * Finds the `attachEntity` stub, validates its `(L<Entity>;)V` signature, warns if the body
+     * isn't the expected 1-byte RETURN, and injects `$1.__boxStore = $0.boxStoreForEntities;`.
+     * No-op (returns false) if the stub is absent OR already assigns `__boxStore` (user manually
+     * implemented the wiring, respect it).
+     *
+     * Extracted from the pre-@Embedded monolithic `transformCursor()` so it composes with
+     * [transformAttachEmbedded] — both edit the in-memory CtClass, and the caller does the
+     * single writeFile().
+     */
+    private fun transformAttachEntity(ctClass: CtClass, classPool: ClassPool): Boolean {
+        val attachCtMethod =
+            ctClass.declaredMethods?.singleOrNull { it.name == ClassConst.cursorAttachEntityMethodName }
+            ?: return false
+
+        val signature = attachCtMethod.signature
+        if (!signature.startsWith("(L") || !signature.endsWith(";)V") || signature.contains(',')) {
+            throw TransformException(
+                "${ctClass.name} The signature of ${ClassConst.cursorAttachEntityMethodName} is not as expected, but was '$signature'."
+            )
+        }
+
+        val existingCode = attachCtMethod.methodInfo.codeAttribute.code
+        if (existingCode.size != 1 || existingCode[0] != Opcode.RETURN.toByte()) {
+            logWarning("${ctClass.name}.${ClassConst.cursorAttachEntityMethodName}  body expected to be empty, might lead to unexpected behavior.")
+        }
+
+        if (attachCtMethod.assignsBoxStoreField()) {
+            log(
+                "${ctClass.name}.${ClassConst.cursorAttachEntityMethodName} assigns " +
+                        "${ClassConst.boxStoreFieldName}, make sure to read ${TextSnippet.URL_RELATIONS_INIT_MAGIC}."
+            )
+            return false // just copy, change nothing
+        }
+
+        checkEntityIsInClassPool(classPool, signature)
+
+        val code = "\$1.${ClassConst.boxStoreFieldName} = \$0.${ClassConst.cursorBoxStoreFieldName};"
+        attachCtMethod.insertAfter(code)
+        return true
+    }
+
+    /**
+     * Finds the `attachEmbedded` stub (M2.3 emits it with an empty body — same 1-byte-RETURN
+     * invariant as `attachEntity`), looks up the entity's embedded-container metadata from the
+     * Context stash (populated during phase-A in `transformEntity()`), and REPLACES the stub body
+     * with the hydration sequence built by [EmbeddedTransform.buildAttachEmbeddedBody].
+     *
+     * No-op (returns false) if:
+     *   - The stub is absent — entity has no `@Embedded` fields, nothing to hydrate. Base
+     *     `Cursor.attachEmbedded(T)` no-op suffices.
+     *   - The entity's metadata isn't in the Context stash — means the entity wasn't in this
+     *     transformer's class set (e.g. cross-module entity). Warn + skip; the user will see
+     *     empty containers at runtime (hydration never fires), which is diagnosable but not a
+     *     hard crash. A hard error here could block builds where the entity genuinely lives
+     *     in another module and gets its OWN transformer pass there.
+     *
+     * Uses `setBody()` (full replace) rather than `insertAfter()` (append before RETURN) because
+     * the hydration body starts with a null-guard-and-early-return — `insertAfter` would put that
+     * AFTER whatever's already there (which is just RETURN, so it'd be unreachable). `setBody()`
+     * discards the stub entirely and emits fresh bytecode from the source string.
+     */
+    private fun transformAttachEmbedded(context: Context, ctClass: CtClass): Boolean {
+        // The base Cursor declares `public void attachEmbedded(@Nullable T)` — overriding it
+        // in a generic subclass causes the compiler to emit a BRIDGE method
+        // (`attachEmbedded(Ljava/lang/Object;)V`) that casts-and-delegates to the concrete
+        // override (`attachEmbedded(L<Entity>;)V`). Both land in `declaredMethods`, so a naive
+        // name-match + `singleOrNull` sees two and returns null. Filter by ACC_BRIDGE (0x40) —
+        // we want the REAL override, not the erasure bridge.
+        //
+        // (`attachEntity` above doesn't have this problem — the base Cursor has no method by
+        // that name, so no bridge is generated. The asymmetry is: attachEntity is a NAMING
+        // CONVENTION the transformer looks for, attachEmbedded is an ACTUAL BASE METHOD.)
+        //
+        // Also filter out the List-overload shape — the base has a `final` list-taking variant
+        // that SHOULDN'T appear in declaredMethods (it's final, can't be overridden), but
+        // belt-and-suspenders on the signature check in case some future refactor un-finals it.
+        val attachCtMethod = ctClass.declaredMethods
+            ?.singleOrNull {
+                it.name == ClassConst.cursorAttachEmbeddedMethodName
+                    && (it.methodInfo.accessFlags and AccessFlag.BRIDGE) == 0
+                    && it.signature.startsWith("(L") && it.signature.endsWith(";)V")
+                    && !it.signature.contains("java/util/List")
+            }
+            ?: return false
+
+        // Extract entity FQN from the descriptor — same trick as checkEntityIsInClassPool().
+        // `(Lcom/example/Bill;)V` → drop `(L` (2 chars) + drop `;)V` (3 chars) → `com/example/Bill`.
+        val signature = attachCtMethod.signature
+        val entityFqn = signature.drop(2).dropLast(3).replace('/', '.')
+
+        // Phase-A stash lookup. If absent, the entity wasn't processed in THIS transformer run —
+        // cross-module scenario, or the entity class was accidentally excluded from the set.
+        val containers = context.embeddedContainersByEntity[entityFqn]
+        if (containers == null) {
+            logWarning(
+                "${ctClass.name}.${ClassConst.cursorAttachEmbeddedMethodName}: entity '$entityFqn' " +
+                    "was not transformed in this pass (no embedded metadata available). " +
+                    "Hydration body NOT injected — @Embedded containers will stay null after reads. " +
+                    "Ensure the entity class is included in the transformer's class set."
+            )
+            return false
+        }
+
+        // Idempotency / already-transformed check — if the stub isn't the 1-byte RETURN we expect,
+        // it was either already transformed (re-run) or hand-written. Warn but proceed: setBody()
+        // replaces unconditionally, which is the correct behaviour for a re-run (the metadata may
+        // have changed). A hand-written body would be lost, but M2.3's contract is "the stub body
+        // is owned by the transformer" — hand-written bodies are a user-error.
+        val existingCode = attachCtMethod.methodInfo.codeAttribute.code
+        if (existingCode.size != 1 || existingCode[0] != Opcode.RETURN.toByte()) {
+            logWarning(
+                "${ctClass.name}.${ClassConst.cursorAttachEmbeddedMethodName} body expected to be " +
+                    "empty (APT-generated stub). Existing body will be REPLACED with hydration code. " +
+                    "If you hand-wrote this method, move your logic elsewhere — the transformer owns this body."
+            )
+        }
+
+        // Ensure the entity CtClass (with the synthetic flat fields that phase-A injected) is
+        // in the pool — Javassist needs to resolve `$1.priceCurrency` field refs at setBody() time.
+        // It almost certainly IS (phase-A just transformed it in-pool), but belt-and-suspenders.
+        // Note: the container POJO types were already loaded into the pool during phase-A's
+        // discoverEmbeddedContainers(), so `new MoneyEmbeddable()` resolves too.
+        if (context.classPool.getOrNull(entityFqn) == null) {
+            logWarning("${ctClass.name}: entity '$entityFqn' not in class pool at cursor-transform time (unexpected).")
+            // Can't safely setBody without the entity type — field refs won't resolve.
+            return false
+        }
+
+        val body = EmbeddedTransform.buildAttachEmbeddedBody(containers)
+        if (debug) log("Injecting attachEmbedded body into ${ctClass.name}: $body")
+        attachCtMethod.setBody(body)
+        context.stats.embeddedAttachBodiesInjected++
+        return true
     }
 
     private fun checkEntityIsInClassPool(classPool: ClassPool, signature: String) {

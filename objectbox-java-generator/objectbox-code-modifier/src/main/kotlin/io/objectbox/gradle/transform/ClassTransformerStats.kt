@@ -41,6 +41,14 @@ class ClassTransformerStats {
     var boxStoreFieldsMadeVisible = 0
     var boxStoreFieldsAdded = 0
 
+    // ── @Embedded (component mapping) ───────────────────────────────────────────────────
+    /** Count of `@Embedded`-annotated container fields discovered across all entities. */
+    var embeddedContainersFound = 0
+    /** Count of synthetic `transient` flat-fields injected onto entities (sum over all containers). */
+    var embeddedSyntheticFieldsAdded = 0
+    /** Count of cursors whose `attachEmbedded()` stub was rewritten with a hydration body. */
+    var embeddedAttachBodiesInjected = 0
+
     fun done() {
         endTime = System.currentTimeMillis()
         log("Transformed $countTransformed entities and copied $countCopied classes in $time ms")
