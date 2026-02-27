@@ -1,0 +1,35 @@
+// Plugins must be in (test) classpath of objectbox-gradle-plugin
+plugins {
+    id "net.ltgt.apt" version "0.12"
+    id 'io.objectbox'
+    id 'java'
+}
+
+// enable ObjectBox plugin and processor debug output
+objectbox {
+    debug true
+}
+
+tasks.withType(JavaCompile) {
+    options.compilerArgs += [ "-Aobjectbox.debug=true" ]
+}
+
+dependencies {
+    testCompile 'junit:junit:4.12'
+    testCompile "org.mockito:mockito-core:$mockitoVersion"
+}
+
+repositories {
+    // Adding maven repo with custom credentials does not seem to work (user properties could not be read)
+
+    // Ensure to have the correct ObjectBox version deployed here
+    mavenLocal()
+
+    // Not the most current, but OK for now for Jenkins
+    maven {
+        url "http://objectbox.net/beta-repo/"
+    }
+
+    // For essentials
+    mavenCentral()
+}

@@ -1,0 +1,153 @@
+# https://docs.gitlab.com/ci/yaml/
+
+# Default image for linux builds
+image: objectboxio/buildenv-android:2024-12-09 # With JDK 21, Android SDK 35 pre-installed
+
+# Assumes these environment variables are configured in GitLab CI/CD Settings:
+# - SONATYPE_USER
+# - SONATYPE_PWD
+# - GOOGLE_CHAT_WEBHOOK_JAVA_CI
+# Additionally, these environment variables used by the objectbox-publish Gradle script:
+# - ORG_GRADLE_PROJECT_signingKeyFile
+# - ORG_GRADLE_PROJECT_signingKeyId
+# - ORG_GRADLE_PROJECT_signingPassword
+
+variables:
+  OBX_RELEASE:
+    value: "false"
+    options: [ "false", "true" ]
+    description: "Turns on the release flag in the Gradle root build script, which triggers building and publishing a
+                  release of the Gradle plugin artifacts to the internal GitLab repository and Maven Central.
+                  Consult the release checklist before turning this on."
+
+  # Disable the Gradle daemon. Gradle may run in a Docker container with a shared
+  # Docker volume containing GRADLE_USER_HOME. If the container is stopped after a job
+  # Gradle daemons may get killed, preventing proper clean-up of lock files in GRADLE_USER_HOME.
+  # Use low priority processes to avoid Gradle builds consuming all build machine resources.
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.priority=low"
+  GITLAB_REPO_ARGS: "-PgitlabUrl=$CI_SERVER_URL -PgitlabTokenName=Job-Token -PgitlabToken=$CI_JOB_TOKEN"
+  CENTRAL_REPO_ARGS: "-PsonatypeUsername=$SONATYPE_USER -PsonatypePassword=$SONATYPE_PWD"
+  # CI_COMMIT_REF_SLUG is the branch or tag name, but web-safe (only 0-9, a-z)
+  VERSION_ARGS: "-PversionPostFix=$CI_COMMIT_REF_SLUG"
+
+stages:
+  - test
+  - publish-maven-internal
+  - publish-maven-central
+  - triggers
+
+workflow:
+  rules:
+    # Disable merge request pipelines https://docs.gitlab.com/ci/jobs/job_rules/#ci_pipeline_source-predefined-variable
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    # Never create a pipeline when a tag is pushed (to simplify version computation in root build script)
+    - if: $CI_COMMIT_TAG
+      when: never
+    # In all other cases, create a pipeline
+    - when: always
+
+.common:
+  before_script:
+    # Print Gradle and JVM version info
+    - ./gradlew -version
+    # Add token for build tracker
+    - ./scripts/set-analysis-token.sh $JAVA_ANALYSIS_TOKENFILE
+
+# Template for tests
+.tests:
+  extends: .common
+  stage: test
+  script:
+    - ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS clean check
+  artifacts:
+    when: always
+    reports:
+      junit: "**/build/test-results/**/TEST-*.xml"
+
+test:linux:
+  extends: .tests
+  tags:
+    - docker
+    - linux
+    - x64
+
+test:windows:
+  extends: .tests
+  tags:
+    - windows-jdk
+    - x64
+
+publish-maven-internal:linux:
+  extends: .common
+  stage: publish-maven-internal
+  tags:
+    - docker
+    - linux
+    - x64
+  rules:
+    # Not for main branch, doing so may duplicate release artifacts (uploaded from publish branch)
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    # Not if triggered by upstream project to save on disk space
+    - if: $CI_PIPELINE_SOURCE == "pipeline"
+      when: never
+    # Otherwise, only if no previous stages failed
+    - when: on_success
+  script:
+    - ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS publishMavenJavaPublicationToGitLabRepository
+
+publish-maven-central:linux:
+  extends: .common
+  stage: publish-maven-central
+  tags:
+    - docker
+    - linux
+    - x64
+  rules:
+    # Only if release mode is on, only if no previous stages failed
+    - if: $OBX_RELEASE == "true"
+      when: on_success
+  script:
+    # Note: can not use before_script for Chat notification as it would overwrite the one from .common (feel free to improve)
+    - ci/send-to-gchat.sh "$GOOGLE_CHAT_WEBHOOK_JAVA_CI" --thread $CI_COMMIT_SHA "*Releasing Java Gradle plugin:* $CI_JOB_NAME from branch $CI_COMMIT_BRANCH ($CI_COMMIT_SHORT_SHA)..."
+    - ./gradlew $GITLAB_REPO_ARGS $VERSION_ARGS $CENTRAL_REPO_ARGS publishMavenJavaPublicationToSonatypeRepository closeAndReleaseSonatypeStagingRepository
+    - echo "Published successfully to Central - check https://repo1.maven.org/maven2/io/objectbox/ in a few minutes."
+  after_script:  # also runs on failure, so show CI_JOB_STATUS
+    - ci/send-to-gchat.sh "$GOOGLE_CHAT_WEBHOOK_JAVA_CI" --thread $CI_COMMIT_SHA "*Releasing Java Gradle plugin:* *$CI_JOB_STATUS* for $CI_JOB_NAME"
+    - ci/send-to-gchat.sh "$GOOGLE_CHAT_WEBHOOK_JAVA_CI" --thread $CI_COMMIT_SHA "Check https://repo1.maven.org/maven2/io/objectbox/ in a few minutes."
+
+# Run integration tests to test new Maven snapshots of this and upstream projects
+trigger-integ-tests:
+  stage: triggers
+  rules:
+    # Not when publishing a release
+    - if: $OBX_RELEASE == "true"
+      when: never
+    # Otherwise, only if no previous stages failed. Also set allow_failure in case branch does not exist downstream.
+    - when: on_success
+  inherit:
+    variables: false
+  allow_failure: true # Branch might not exist in triggered project
+  trigger:
+    project: objectbox/objectbox-integration-test
+    branch: $CI_COMMIT_BRANCH
+
+# Build and test the Maven plugin with new Maven snapshots of this project (it uses the code modifier)
+trigger-maven-plugin:
+  stage: triggers
+  rules:
+    # Not when publishing a release
+    - if: $OBX_RELEASE == "true"
+      when: never
+    # Do not trigger publishing of Maven plugin
+    - if: $CI_COMMIT_BRANCH == "publish"
+      when: never
+    # Otherwise, only if no previous stages failed. Also set allow_failure in case branch does not exist downstream.
+    - when: on_success
+  inherit:
+    variables: false
+  allow_failure: true # Branch might not exist in triggered project
+  trigger:
+    project: objectbox/objectbox-maven-plugin
+    branch: $CI_COMMIT_BRANCH

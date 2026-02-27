@@ -1,0 +1,255 @@
+{
+  "_note1": "KEEP THIS FILE! Check it into a version control system (VCS) like git.",
+  "_note2": "ObjectBox manages crucial IDs for your object model. See docs for details.",
+  "_note3": "If you have VCS merge conflicts, you must resolve them according to ObjectBox docs.",
+  "entities": [
+    {
+      "id": "1:4858050548069557694",
+      "lastPropertyId": "40:8362209306839260233",
+      "name": "A",
+      "properties": [
+        {
+          "id": "1:8303367770402050741",
+          "name": "id",
+          "type": 6,
+          "flags": 129
+        },
+        {
+          "id": "2:2547454299149596320",
+          "name": "simpleShortPrimitive",
+          "type": 3
+        },
+        {
+          "id": "3:1065398153566608274",
+          "name": "simpleShort",
+          "type": 3
+        },
+        {
+          "id": "4:7019841740086346212",
+          "name": "simpleIntPrimitive",
+          "type": 5
+        },
+        {
+          "id": "5:2149606992334875025",
+          "name": "simpleInt",
+          "type": 5
+        },
+        {
+          "id": "6:3870774530785480176",
+          "name": "simpleLongPrimitive",
+          "type": 6
+        },
+        {
+          "id": "7:6076934711032013633",
+          "name": "simpleLong",
+          "type": 6
+        },
+        {
+          "id": "8:1005325329902505869",
+          "name": "simpleFloatPrimitive",
+          "type": 7
+        },
+        {
+          "id": "9:6013849627054382655",
+          "name": "simpleFloat",
+          "type": 7
+        },
+        {
+          "id": "10:1714793024529017564",
+          "name": "simpleDoublePrimitive",
+          "type": 8
+        },
+        {
+          "id": "11:1265968316355477242",
+          "name": "simpleDouble",
+          "type": 8
+        },
+        {
+          "id": "12:4472277657621006188",
+          "name": "simpleBooleanPrimitive",
+          "type": 1
+        },
+        {
+          "id": "13:7658102659822256293",
+          "name": "simpleBoolean",
+          "type": 1
+        },
+        {
+          "id": "14:4560729911540009437",
+          "name": "simpleBytePrimitive",
+          "type": 2
+        },
+        {
+          "id": "15:1331388668561714029",
+          "name": "simpleByte",
+          "type": 2
+        },
+        {
+          "id": "16:3711768428068804965",
+          "name": "simpleDate",
+          "type": 10
+        },
+        {
+          "id": "17:6798801512033870238",
+          "name": "simpleString",
+          "type": 9
+        },
+        {
+          "id": "18:5561205097618864485",
+          "name": "simpleByteArray",
+          "type": 23
+        },
+        {
+          "id": "19:267919077724297667",
+          "name": "indexedProperty",
+          "indexId": "1:4551328960004588074",
+          "type": 5,
+          "flags": 8
+        },
+        {
+          "id": "20:8754346312277232208",
+          "name": "B",
+          "type": 9
+        },
+        {
+          "id": "21:8133069888579241668",
+          "name": "customType",
+          "type": 5
+        },
+        {
+          "id": "22:4772590935549770830",
+          "name": "customTypes",
+          "type": 5
+        },
+        {
+          "id": "23:1838261170942203646",
+          "name": "simpleCharPrimitive",
+          "type": 4
+        },
+        {
+          "id": "24:2870459311547136401",
+          "name": "simpleChar",
+          "type": 4
+        },
+        {
+          "id": "25:8807838229280449251",
+          "name": "toOneId",
+          "indexId": "2:6174264050444102923",
+          "type": 11,
+          "flags": 520,
+          "relationTarget": "IdEntity"
+        },
+        {
+          "id": "26:6896463341468697768",
+          "name": "simpleStringArray",
+          "type": 30
+        },
+        {
+          "id": "27:1074761176027041968",
+          "name": "dateNanoPrimitive",
+          "type": 12
+        },
+        {
+          "id": "28:3312356255575143881",
+          "name": "dateNano",
+          "type": 12
+        },
+        {
+          "id": "29:5381545072285823697",
+          "name": "idCompanion",
+          "type": 10,
+          "flags": 16384
+        },
+        {
+          "id": "30:8403031692314570141",
+          "name": "simpleStringList",
+          "type": 30
+        },
+        {
+          "id": "31:553518482816470515",
+          "name": "stringFlexMap",
+          "type": 13
+        },
+        {
+          "id": "32:4612611183471672203",
+          "name": "flexProperty",
+          "type": 13
+        },
+        {
+          "id": "33:1725775029481425568",
+          "name": "shortArray",
+          "type": 24
+        },
+        {
+          "id": "34:4774093004605044306",
+          "name": "charArray",
+          "type": 25
+        },
+        {
+          "id": "35:6776589142355880307",
+          "name": "intArray",
+          "type": 26
+        },
+        {
+          "id": "36:9006144140894927873",
+          "name": "longArray",
+          "type": 27
+        },
+        {
+          "id": "37:289592308738182865",
+          "name": "floatArray",
+          "type": 28
+        },
+        {
+          "id": "38:6410324640289798251",
+          "name": "doubleArray",
+          "type": 29
+        },
+        {
+          "id": "39:8513602819579966935",
+          "name": "floatArrayHnsw",
+          "indexId": "3:4603777245389737989",
+          "type": 28,
+          "flags": 8
+        },
+        {
+          "id": "40:8362209306839260233",
+          "name": "booleanArray",
+          "type": 22
+        }
+      ],
+      "relations": [
+        {
+          "id": "1:1588763188636253926",
+          "name": "toMany",
+          "targetId": "2:7806468668391521694"
+        }
+      ]
+    },
+    {
+      "id": "2:7806468668391521694",
+      "lastPropertyId": "1:4951803424764837731",
+      "name": "IdEntity",
+      "properties": [
+        {
+          "id": "1:4951803424764837731",
+          "name": "id",
+          "type": 6,
+          "flags": 1
+        }
+      ],
+      "relations": []
+    }
+  ],
+  "lastEntityId": "2:7806468668391521694",
+  "lastIndexId": "3:4603777245389737989",
+  "lastRelationId": "1:1588763188636253926",
+  "lastSequenceId": "0:0",
+  "modelVersion": 5,
+  "modelVersionParserMinimum": 5,
+  "retiredEntityUids": [],
+  "retiredIndexUids": [],
+  "retiredPropertyUids": [],
+  "retiredRelationUids": [],
+  "version": 1
+}
