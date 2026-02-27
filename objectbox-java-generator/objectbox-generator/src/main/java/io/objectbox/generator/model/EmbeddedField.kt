@@ -84,6 +84,31 @@ class EmbeddedField(
         get() = if (isFieldAccessible) name else "get" + TextUtil.capFirst(name) + "()"
 
     /**
+     * Expression for writing the container back to the entity, relative to `entity.` and given
+     * a value expression.
+     *
+     * E.g. `price = {value}` (field-accessible) or `setPrice({value})`.
+     * Used by `attachEmbedded()` codegen (M2.3) to assign the hydrated container.
+     */
+    fun containerSetExpression(value: String): String =
+        if (isFieldAccessible) "$name = $value" else "set${TextUtil.capFirst(name)}($value)"
+
+    /**
+     * Local variable name used in generated `put()` body to hold the hoisted container reference.
+     *
+     * Pattern: `__emb_<name>` — follows the generator's double-underscore convention for
+     * internals (`__id`, `__assignedId`) and is distinct from any user field (Java identifiers
+     * can't start with `__emb_` and still collide with a user's `price` field).
+     *
+     * Hoisting once per container (rather than `entity.price` inline at each use site) avoids
+     * repeated `entity.price != null` evaluations and — critically — ensures the null-guard
+     * and the value-read see the SAME reference if user code mutates `entity.price` concurrently
+     * (unlikely inside a sync `put()`, but correctness-by-construction).
+     */
+    val localVarName: String
+        get() = "__emb_$name"
+
+    /**
      * Registers a synthetic property as produced by this embedded field.
      * Call after [Entity.addProperty] — the property is already in the entity's list;
      * this secondary registration enables M2 codegen to iterate per-container.

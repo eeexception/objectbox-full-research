@@ -111,4 +111,19 @@ ${propertyCollector}
     }
 
 </#if>
+<#if entity.hasEmbedded()>
+<#-- Read-path hydration STUB for @Embedded containers.
+     Called by base Cursor.get()/next()/first()/getAll() AFTER native sets flat synthetic fields.
+     Body MUST be empty at APT time: synthetic flat fields are injected by the post-APT bytecode
+     transformer — referencing them here would fail javac. The transformer injects the hydration
+     body into this stub in the same pass as the field injection, keeping declaration and use in
+     the same build phase. Same pattern as attachEntity() above. -->
+    @Override
+    public void attachEmbedded(${entity.className} entity) {
+        if (entity == null) return;
+        // Transformer will inject @Embedded hydration here: for each container, instantiate it,
+        // copy flat synthetic fields (set by native) into it, assign to the entity field.
+    }
+
+</#if>
 }

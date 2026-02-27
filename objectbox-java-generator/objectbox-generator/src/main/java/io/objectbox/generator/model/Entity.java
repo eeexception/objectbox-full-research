@@ -467,6 +467,18 @@ public class Entity implements HasParsedElement {
             checkAdditionalImportsDaoTargetEntity(targetEntity);
         }
 
+        // @Embedded container types: the generated Cursor's put() declares a hoisted local
+        // (`Money __emb_price = entity.price`) typed as the embedded class, so the Cursor
+        // needs an import if the embedded type lives outside the DAO package. Same pattern
+        // as customType/converter below — only add if package differs.
+        for (EmbeddedField embedded : embeddedFields) {
+            String typeFqn = embedded.getTypeFullyQualifiedName();
+            String pack = TextUtil.getPackageFromFullyQualified(typeFqn);
+            if (pack != null && !pack.equals(javaPackageDao)) {
+                additionalImportsDao.add(typeFqn);
+            }
+        }
+
         for (Property property : properties) {
             String customType = property.getCustomType();
             if (customType != null) {

@@ -569,6 +569,40 @@ public class Property implements HasParsedElement {
         return embeddedSourceFieldAccessible;
     }
 
+    /**
+     * Expression for reading this property's value from its embedded container, relative to a
+     * container reference. E.g. {@code currency} (field access) or {@code getCurrency()} (getter).
+     * <p>
+     * Only meaningful if {@link #isEmbedded()}. Used by {@link io.objectbox.generator.PropertyCollector}
+     * to build {@code <localVar>.<thisExpression>} — e.g. {@code __emb_price.currency}.
+     * <p>
+     * Mirrors {@link #getValueExpression()} but operates on the INNER field name
+     * ({@link #getEmbeddedSourceFieldName()}) rather than the synthetic property name.
+     */
+    public String getEmbeddedSourceValueExpression() {
+        if (embeddedSourceFieldAccessible) {
+            return embeddedSourceFieldName;
+        } else {
+            return "get" + TextUtil.capFirst(embeddedSourceFieldName) + "()";
+        }
+    }
+
+    /**
+     * Expression for writing this property's value back into its embedded container, relative
+     * to a container reference and given a value expression.
+     * E.g. {@code currency = {value}} (field access) or {@code setCurrency({value})} (setter).
+     * <p>
+     * Only meaningful if {@link #isEmbedded()}. Used by the transformer-injected
+     * {@code attachEmbedded()} body (and by M2.3's stub-comment documentation).
+     */
+    public String getEmbeddedSourceSetExpression(String value) {
+        if (embeddedSourceFieldAccessible) {
+            return embeddedSourceFieldName + " = " + value;
+        } else {
+            return "set" + TextUtil.capFirst(embeddedSourceFieldName) + "(" + value + ")";
+        }
+    }
+
     public String getGetterMethodName() {
         return getterMethodName;
     }

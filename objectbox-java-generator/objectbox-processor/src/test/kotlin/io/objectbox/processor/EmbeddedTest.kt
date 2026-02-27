@@ -22,6 +22,7 @@ import com.google.common.truth.Truth.assertThat
 import io.objectbox.generator.model.PropertyType
 import org.intellij.lang.annotations.Language
 import org.junit.Test
+import java.nio.charset.StandardCharsets
 
 /**
  * Tests for `@Embedded` annotation processing.
@@ -606,4 +607,352 @@ class EmbeddedTest : BaseProcessorTest() {
     }
 
     // endregion M1.3
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // region M2.2 — Write path: put() reads through the embedded container
+    //
+    // Generated Cursor.put() must dereference `entity.price.currency` (the REAL path on the
+    // user's entity) rather than `entity.priceCurrency` (the synthetic field that doesn't
+    // exist until the transformer runs). The container (`entity.price`) can be null, so every
+    // embedded property's value must be guarded: when the container is null, pass property-ID
+    // zero (tells native "skip this column") and a type-default value (ignored by native).
+    //
+    // Test strategy: the RED state is M1's `put()` which SKIPS embedded properties entirely —
+    // `collect004000` with all zeros. GREEN state: `collect313311` (1 String + 1 Long triggers
+    // that signature) with hoisted container local, conditional IDs, and container-path reads.
+    //
+    // We use `contentsAsString().contains()` fragment assertions rather than full source match
+    // because (a) the exact collect signature could change with future properties added to the
+    // test entity, and (b) failure messages are sharper ("expected `__emb_price.currency`").
+    // The critical proof is that the generated Cursor COMPILES (javac validates every access
+    // path) AND contains the container-path reads.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * RED driver: M1's `PropertyCollector` constructor skips `isEmbedded()` properties, so
+     * `put()` passes zeros for those columns — data written via `box.put(bill)` would silently
+     * drop `currency` and `amount`.
+     *
+     * GREEN: `put()` body must contain, in order:
+     *  1. **Hoisted container local** — `Money __emb_price = entity.price;` — computed once,
+     *     reused for all synthetic properties from this container. Avoids repeated
+     *     `entity.price != null` evaluations AND makes the null-guard structure obvious.
+     *  2. **Conditional property-IDs** — `int __idN = __emb_price != null ? __ID_X : 0;` —
+     *     ID=0 tells native collect() to skip the column (leaves it NULL in DB). This is the
+     *     SAME mechanism used for nullable scalar properties already.
+     *  3. **Container-path reads** — `__emb_price.currency` / `__emb_price.amount` — NOT
+     *     `entity.priceCurrency` (synthetic name).
+     *
+     * Negative assertions prove M1's fail-loud guard didn't silently leak through: the
+     * generated put() must NOT contain `getPriceCurrency()` (the default value-expression for
+     * a non-field-accessible synthetic property) and must NOT pass literal 0/null for
+     * property-ID 0 in the slots that should carry data.
+     */
+    @Test
+    fun embedded_put_readsThroughContainerWithNullGuard() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-put.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        val compilation = env.compile()
+
+        // Gate: generated Cursor must COMPILE. If this fails, javac rejected a container-path
+        // read (e.g. `Money` not imported, or `entity.price` not accessible, or a missing
+        // synthetic-name getter leaked through).
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        // Inspect put() body.
+        val cursor = compilation.generatedSourceFileOrFail("com.example.BillCursor")
+        val src = cursor.contentsAsString(StandardCharsets.UTF_8)
+
+        // ─── 1. Hoisted container local ───
+        // The exact variable name prefix `__emb_` is our chosen convention — it mirrors
+        // `__id`, `__assignedId`, etc. (double-underscore prefix = generator-internal).
+        src.contains("Money __emb_price = entity.price;")
+
+        // ─── 2. Conditional property-IDs guarded on container null ───
+        // Both embedded properties must route through the same hoisted local.
+        src.contains("__emb_price != null ? __ID_priceCurrency : 0")
+        src.contains("__emb_price != null ? __ID_priceAmount : 0")
+
+        // ─── 3. Container-path reads ───
+        // `__emb_price.currency` proves the READ goes through the container's real field,
+        // not through a synthetic-named field on the entity.
+        src.contains("__emb_price.currency")
+        src.contains("__emb_price.amount")
+
+        // ─── Negative: fail-loud guards must not have leaked ───
+        // If M2's PropertyCollector forgot to handle isEmbedded() and fell through to the
+        // default path, the generated put() would reference a non-existent getter
+        // (and javac would have failed the succeededWithoutWarnings() gate above — but
+        // belt-and-suspenders here for clarity).
+        src.doesNotContain("getPriceCurrency")
+        src.doesNotContain("getPriceAmount")
+
+        // ─── Negative: M1's skip must not still be in effect ───
+        // M1's put() was `collect004000(... 0, 0, 0, 0, 0, 0, 0, 0)` — no real data.
+        // After M2, at least one collect call must reference __ID_priceCurrency by name
+        // (indirectly via the conditional), not just zeros.
+        src.doesNotContain("collect004000")
+    }
+
+    /**
+     * Two `@Embedded` fields → put() must hoist TWO distinct container locals and guard each
+     * synthetic property on its OWN container. Regression guard for the "hoist once per
+     * container, not per property" design: ensures the hoisting loop iterates
+     * `entity.getEmbeddedFields()` correctly and doesn't e.g. hoist only the first container
+     * or use the wrong local for cross-container properties.
+     */
+    @Test
+    fun embedded_put_twoContainers_hoistedIndependently() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val transfer =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Transfer {
+                @Id public long id;
+                @Embedded public Money source;
+                @Embedded public Money target;
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-put-two.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Transfer", transfer)
+            }
+
+        val compilation = env.compile()
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation.generatedSourceFileOrFail("com.example.TransferCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // Each container hoisted to its own local — not mixed up.
+        src.contains("Money __emb_source = entity.source;")
+        src.contains("Money __emb_target = entity.target;")
+
+        // Cross-check: each property guarded on the CORRECT container.
+        // sourceCurrency → guarded by __emb_source (not target).
+        src.contains("__emb_source != null ? __ID_sourceCurrency : 0")
+        src.contains("__emb_source.currency")
+        // targetAmount → guarded by __emb_target (not source).
+        src.contains("__emb_target != null ? __ID_targetAmount : 0")
+        src.contains("__emb_target.amount")
+    }
+
+    // endregion M2.2
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // region M2.3 — Read path: attachEmbedded() override STUB
+    //
+    // Writes go through put() above. Reads are a harder problem: JNI (native C++) constructs
+    // the entity object directly and sets fields by `Property.name` — there is NO Java-side
+    // hook during nativeGetEntity(). So at read time, native sets `entity.priceCurrency` and
+    // `entity.priceAmount` (the transformer-injected synthetic flat fields), NOT
+    // `entity.price.currency`. The container `entity.price` is null post-native.
+    //
+    // M0 wired a post-read hook: base `Cursor.attachEmbedded(T)` is a no-op called by
+    // get()/next()/first()/getAll()/Query.find*() immediately after native returns. The
+    // generated Cursor overrides it to hydrate: `entity.price = new Money();
+    // entity.price.currency = entity.priceCurrency; ...`.
+    //
+    // BUT — those synthetic fields (`entity.priceCurrency`) don't exist at annotation-processor
+    // time. They are injected by the M3 bytecode transformer AFTER APT compiles the Cursor.
+    // Therefore the generated override must be a **STUB**: empty body (except a null-guard) with
+    // a descriptive comment. The transformer injects the hydration body alongside injecting the
+    // synthetic entity fields — keeping the field-declaration and field-use in the SAME build
+    // phase (post-APT), so APT's javac pass always sees compilable code.
+    //
+    // This exactly mirrors the existing `attachEntity()` stub pattern in cursor.ftl: the
+    // transformer injects `entity.__boxStore = boxStoreForEntities;` because `__boxStore` is
+    // itself a transformer-injected field.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * RED driver: today the generated Cursor has no `attachEmbedded` override at all — the
+     * base no-op runs, and after a `box.get(id)` the user sees `bill.price == null` despite
+     * `priceCurrency`/`priceAmount` being set on the (post-transformer) flat fields.
+     *
+     * GREEN: the generated Cursor emits an `@Override public void attachEmbedded(Bill entity)`
+     * stub with:
+     *  - A null-guard (the base method is called with `@Nullable T` — get()/first() return null
+     *    when the key doesn't exist, and native may yield null during iteration end).
+     *  - NO actual hydration code — the body references ONLY things that exist at APT time
+     *    (i.e. nothing: the stub body is the null-guard and a comment).
+     *  - A descriptive comment showing M3 what to inject, mirroring `attachEntity()`.
+     *
+     * Critically, the stub must NOT reference `entity.priceCurrency` or `new Money()` — those
+     * would fail the `succeededWithoutWarnings()` gate because the synthetic flat fields don't
+     * exist yet. The gate IS the real proof here; the `doesNotContain()` fragment-asserts are
+     * belt-and-suspenders documentation of the contract.
+     */
+    @Test
+    fun embedded_attachEmbedded_generatesEmptyStubWithNullGuard() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-attach.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        val compilation = env.compile()
+
+        // Gate: the stub must be valid Java at APT time. If the stub prematurely references
+        // a transformer-injected field, THIS LINE fails first with a sharp javac error.
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation.generatedSourceFileOrFail("com.example.BillCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // ─── 1. Override signature present ───
+        // Must be `public` (matches base `Cursor.attachEmbedded(T)` visibility — overriding
+        // with reduced visibility is a compile error). Concrete type substituted for T.
+        src.contains("public void attachEmbedded(Bill entity)")
+
+        // ─── 2. Null-guard present ───
+        // The base method is invoked with `@Nullable T` from get()/first()/next(), and the
+        // list overload iterates without filtering nulls. A null-dereference in hydration
+        // would NPE on every not-found get() call.
+        src.contains("if (entity == null) return;")
+
+        // ─── 3. Descriptive comment for M3 transformer ───
+        // Mirrors the attachEntity() stub pattern: a human-readable hint showing WHAT the
+        // transformer will inject and WHY the body is empty here.
+        src.contains("Transformer will inject @Embedded hydration here")
+
+        // ─── Negative: no premature synthetic-field references ───
+        // `entity.priceCurrency` → the transformer-injected transient field. Does NOT exist
+        // at APT time. If this appears in the stub, javac fails (gate above catches it, but
+        // this assert pins the contract explicitly).
+        // Safe negative: `__ID_priceCurrency` (static decl + put()) and `Bill_.priceCurrency`
+        // (static decl) use different prefixes, so a bare `entity.priceCurrency` is unique.
+        src.doesNotContain("entity.priceCurrency")
+        src.doesNotContain("entity.priceAmount")
+
+        // ─── Negative: no premature container instantiation ───
+        // `new Money()` IS valid Java at APT time (Money exists as a source input), but if
+        // it appears here then SOMETHING is assigning to `entity.price` prematurely, which
+        // (a) wastes an allocation every read when no embedded data exists and (b) means the
+        // stub isn't actually a stub — the design contract is broken.
+        src.doesNotContain("new Money()")
+    }
+
+    /**
+     * Negative space: an entity with NO `@Embedded` fields must NOT generate an
+     * `attachEmbedded` override. The base no-op is already optimal (method-call overhead of
+     * an empty final-class method is JIT-inlined to nothing). Generating an empty override
+     * anyway would:
+     *  - bloat every generated Cursor (most entities don't use @Embedded)
+     *  - confuse users reading generated code ("why is this here?")
+     *  - give the M3 transformer a body to inject into even when there's nothing to inject
+     *
+     * Regression guard for the `<#if entity.hasEmbedded()>` FTL gate.
+     */
+    @Test
+    fun embedded_attachEmbedded_notGeneratedWhenEntityHasNoEmbedded() {
+        @Language("Java")
+        val plain =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+
+            @Entity
+            public class Plain {
+                @Id public long id;
+                public String name;
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-attach-absent.json", useTemporaryModelFile = true)
+            .apply { addSourceFile("com.example.Plain", plain) }
+
+        val compilation = env.compile()
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation.generatedSourceFileOrFail("com.example.PlainCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // No @Embedded fields → no override. The base no-op handles it.
+        src.doesNotContain("attachEmbedded")
+    }
+
+    // endregion M2.3
 }

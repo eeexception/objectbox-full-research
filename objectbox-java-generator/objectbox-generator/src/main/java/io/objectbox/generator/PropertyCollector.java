@@ -22,6 +22,7 @@ import org.greenrobot.essentials.collections.Multimap;
 
 import java.util.List;
 
+import io.objectbox.generator.model.EmbeddedField;
 import io.objectbox.generator.model.Entity;
 import io.objectbox.generator.model.Property;
 import io.objectbox.generator.model.PropertyType;
@@ -42,21 +43,22 @@ class PropertyCollector {
     private final Multimap<PropertyType, Property> propertiesByType;
     private final Property idProperty;
 
+    /**
+     * {@code @Embedded} container fields — each contributes N synthetic properties to
+     * {@link #propertiesByType} but also needs a single hoisted local declaration in
+     * {@link #createPropertyCollector()} for null-guarded container-path reads.
+     */
+    private final List<EmbeddedField> embeddedFields;
+
     public PropertyCollector(Entity entity) {
         propertiesByType = Multimap.create();
         for (Property property : entity.getProperties()) {
             if (property.isPrimaryKey()) {
                 continue;
             }
-            if (property.isEmbedded()) {
-                // M1: @Embedded synthetic properties are model-only until M2 lands.
-                // Their default getValueExpression() would emit entity.get<SyntheticName>() —
-                // a method that doesn't exist at APT time (the bytecode transformer injects the
-                // backing field post-process, and there is no getter). M2 will remove this skip
-                // and teach appendProperty() to dereference through the embedded container instead,
-                // with a null-guard on the container field.
-                continue;
-            }
+            // Note: @Embedded synthetic properties ARE included here — appendProperty() handles
+            // them via a dedicated branch that dereferences through the hoisted container local
+            // instead of the default entity.<syntheticName> path.
             propertiesByType.putElement(property.getPropertyType(), property);
         }
         idProperty = entity.getPkProperty();
@@ -64,6 +66,7 @@ class PropertyCollector {
             throw new IllegalStateException("No ID property found for \"" + entity + "\" " +
                     "(use @Id on a property of type long)");
         }
+        embeddedFields = entity.getEmbeddedFields();
     }
 
     /**
@@ -77,6 +80,28 @@ class PropertyCollector {
         StringBuilder preCall = new StringBuilder();
         StringBuilder properties = new StringBuilder();
         StringBuilder all = new StringBuilder();
+
+        // ─── @Embedded container hoisting ───────────────────────────────────────────────
+        // Emit once at the top of put(), before any collect*() call, so every embedded
+        // property from a given container reads through the SAME local reference. This:
+        //   (a) avoids N repeated `entity.price != null` evaluations,
+        //   (b) ensures the null-check and the value-read see the same object (no TOCTOU
+        //       if user code mutates entity.price concurrently — unlikely inside a
+        //       synchronous put(), but correctness-by-construction), and
+        //   (c) gives appendProperty() a stable name (`__emb_<name>`) to reference
+        //       regardless of which collect-call iteration consumes the property.
+        //
+        // Example:  Money __emb_price = entity.price;
+        //           Money __emb_source = entity.source;
+        for (EmbeddedField emb : embeddedFields) {
+            all.append(INDENT)
+               .append(emb.getTypeSimpleName()).append(' ')
+               .append(emb.getLocalVarName()).append(" = entity.")
+               .append(emb.getContainerValueExpression()).append(";\n");
+        }
+        if (!embeddedFields.isEmpty()) {
+            all.append('\n'); // blank line separating hoisting from collect calls (cosmetic)
+        }
 
         boolean first = true;
         int previousPropertyCount = propertiesByType.countElements();
@@ -269,7 +294,29 @@ class PropertyCollector {
             String name = property.getPropertyName();
             String propertyId = "__ID_" + name;
             String propertyIdLocal = "__id" + property.getOrdinal();
-            if (!property.isTypeNotNull()) {
+            if (property.isEmbedded()) {
+                // ─── @Embedded synthetic property ────────────────────────────────────
+                // Read through the hoisted container local (emitted at top of put() by
+                // createPropertyCollector()), NOT through `entity.<syntheticName>` — the
+                // synthetic field only exists post-transformer.
+                //
+                // Always conditional-ID: even if the inner field is a Java primitive
+                // (`long amount` → isTypeNotNull()==true), the *container* is nullable,
+                // so the DB column is nullable. ID=0 → native skips the column → stores
+                // NULL on write. Mirrors the nullable branch below but guards on the
+                // container, not the value.
+                EmbeddedField origin = property.getEmbeddedOrigin();
+                String embVar = origin.getLocalVarName();                               // __emb_price
+                String innerAccess = embVar + "." + property.getEmbeddedSourceValueExpression(); // __emb_price.currency
+
+                preCall.append(INDENT).append("int ").append(propertyIdLocal).append(" = ")
+                       .append(embVar).append(" != null ? ").append(propertyId).append(" : 0;\n");
+
+                sb.append(propertyIdLocal).append(", ");
+                sb.append(propertyIdLocal).append(" != 0 ? ")
+                  .append(property.getDatabaseValueExpression(innerAccess))
+                  .append(isScalar ? " : 0" : " : null");
+            } else if (!property.isTypeNotNull()) {
                 // Nullable type: if null pass zero ID and zero/null value instead.
                 preCall.append(INDENT).append(property.getJavaTypeInEntity()).append(' ').append(name)
                         .append(" = ").append(getValue(property)).append(";\n");
