@@ -20,7 +20,9 @@ package io.objectbox.generator;
 
 import org.greenrobot.essentials.collections.Multimap;
 
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import io.objectbox.generator.model.Entity;
 import io.objectbox.generator.model.Property;
@@ -41,8 +43,10 @@ class PropertyCollector {
      */
     private final Multimap<PropertyType, Property> propertiesByType;
     private final Property idProperty;
+    private final Entity entity;
 
     public PropertyCollector(Entity entity) {
+        this.entity = entity;
         propertiesByType = Multimap.create();
         for (Property property : entity.getProperties()) {
             if (!property.isPrimaryKey()) {
@@ -67,6 +71,20 @@ class PropertyCollector {
         StringBuilder preCall = new StringBuilder();
         StringBuilder properties = new StringBuilder();
         StringBuilder all = new StringBuilder();
+
+        // Extract embedded objects into local variables (one per unique embedded field)
+        Set<String> extractedEmbedded = new LinkedHashSet<>();
+        for (Property property : entity.getProperties()) {
+            if (property.isEmbedded() && extractedEmbedded.add(property.getEmbeddedFieldName())) {
+                all.append(INDENT)
+                        .append(property.getEmbeddedFieldType()).append(' ')
+                        .append(property.getEmbeddedFieldName()).append(" = entity.")
+                        .append(property.getEmbeddedFieldGetter()).append(";\n");
+            }
+        }
+        if (!extractedEmbedded.isEmpty()) {
+            all.append('\n');
+        }
 
         boolean first = true;
         int previousPropertyCount = propertiesByType.countElements();
@@ -259,7 +277,28 @@ class PropertyCollector {
             String name = property.getPropertyName();
             String propertyId = "__ID_" + name;
             String propertyIdLocal = "__id" + property.getOrdinal();
-            if (!property.isTypeNotNull()) {
+            if (property.isEmbedded()) {
+                // Embedded property: value comes from the embedded object local variable
+                String emField = property.getEmbeddedFieldName();
+                String emGetter = property.getEmbeddedPropertyGetter();
+                if (!property.isTypeNotNull()) {
+                    // Nullable (String, wrapper type): extract with embedded null check
+                    preCall.append(INDENT).append(property.getJavaTypeInEntity()).append(' ').append(name)
+                            .append(" = ").append(emField).append(" != null ? ")
+                            .append(emField).append('.').append(emGetter).append(" : null;\n");
+                    preCall.append(INDENT).append("int ").append(propertyIdLocal).append(" = ").append(name)
+                            .append(" != null ? ").append(propertyId).append(" : 0;\n");
+                    sb.append(propertyIdLocal).append(", ");
+                    sb.append(property.getDatabaseValueExpression(name));
+                } else {
+                    // Primitive: pass property ID = 0 when embedded object is null
+                    preCall.append(INDENT).append("int ").append(propertyIdLocal).append(" = ")
+                            .append(emField).append(" != null ? ").append(propertyId).append(" : 0;\n");
+                    sb.append(propertyIdLocal).append(", ");
+                    sb.append(emField).append(" != null ? ").append(emField).append('.')
+                            .append(emGetter).append(" : 0");
+                }
+            } else if (!property.isTypeNotNull()) {
                 // Nullable type: if null pass zero ID and zero/null value instead.
                 preCall.append(INDENT).append(property.getJavaTypeInEntity()).append(' ').append(name)
                         .append(" = ").append(getValue(property)).append(";\n");

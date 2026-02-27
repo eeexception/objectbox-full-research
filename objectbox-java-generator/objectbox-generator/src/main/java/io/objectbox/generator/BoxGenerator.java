@@ -244,10 +244,39 @@ public class BoxGenerator {
 
         imports.addAll(entity.getAdditionalImportsDao());
 
+        // Add imports for embedded types used in cursor code
+        Set<String> embeddedTypesAdded = new java.util.HashSet<>();
+        for (Property property : entity.getProperties()) {
+            if (property.isEmbedded() && embeddedTypesAdded.add(property.getEmbeddedFieldType())) {
+                // The embedded type is referenced as a local variable in the cursor put() method.
+                // Only add import if in a different package than the entity's DAO package.
+                String embeddedFullType = findEmbeddedTypeFullName(entity, property);
+                if (embeddedFullType != null) {
+                    String embeddedPackage = TextUtil.getPackageFromFullyQualified(embeddedFullType);
+                    if (embeddedPackage != null && !embeddedPackage.equals(entity.getJavaPackageDao())) {
+                        imports.add(embeddedFullType);
+                    }
+                }
+            }
+        }
+
         final HashMap<String, Object> map = new HashMap<>();
         map.put("imports", imports);
         map.put("propertyCollector", new PropertyCollector(entity).createPropertyCollector());
         return map;
+    }
+
+    /**
+     * Finds the fully qualified name of an embedded type from an embedded property.
+     * Searches through the entity's additional imports or constructs from entity package.
+     */
+    private String findEmbeddedTypeFullName(Entity entity, Property property) {
+        // By default, assume embedded type is in the same package as the entity
+        String entityPackage = entity.getJavaPackage();
+        if (isNotEmpty(entityPackage)) {
+            return entityPackage + "." + property.getEmbeddedFieldType();
+        }
+        return property.getEmbeddedFieldType();
     }
 
     /**

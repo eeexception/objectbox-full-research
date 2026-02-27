@@ -22,6 +22,7 @@ import io.objectbox.annotation.ConflictStrategy
 import io.objectbox.annotation.Convert
 import io.objectbox.annotation.DatabaseType
 import io.objectbox.annotation.DefaultValue
+import io.objectbox.annotation.Embedded
 import io.objectbox.annotation.ExternalName
 import io.objectbox.annotation.ExternalType
 import io.objectbox.annotation.HnswIndex
@@ -55,7 +56,9 @@ import javax.lang.model.element.AnnotationMirror
 import javax.lang.model.element.Element
 import javax.lang.model.element.ExecutableElement
 import javax.lang.model.element.Modifier
+import javax.lang.model.element.TypeElement
 import javax.lang.model.element.VariableElement
+import javax.lang.model.type.DeclaredType
 import javax.lang.model.type.TypeMirror
 import javax.lang.model.util.ElementFilter
 import javax.lang.model.util.Elements
@@ -129,6 +132,9 @@ class Properties(
             checkNotSuperEntity(field)
             checkNoIndexOrUniqueAnnotation(field, "ToMany")
             relations.parseToMany(entityModel, field)
+        } else if (field.hasAnnotation(Embedded::class.java)) {
+            // @Embedded value object — flatten its fields into this entity
+            parseEmbeddedField(field)
         } else {
             // regular property
             parseProperty(field)
@@ -149,6 +155,123 @@ class Properties(
                 "@$annotationName can not be used with a $relationType relation, remove @$annotationName.",
                 field
             )
+        }
+    }
+
+    /**
+     * Parses an @Embedded field: resolves the embedded type, validates it, and flattens
+     * its fields as prefixed properties in the parent entity model.
+     */
+    private fun parseEmbeddedField(field: VariableElement) {
+        val fieldType = field.asType()
+        val declaredType = fieldType as? DeclaredType
+        if (declaredType == null) {
+            messages.error("@Embedded field must be a class type.", field)
+            return
+        }
+        val embeddedTypeElement = declaredType.asElement() as? TypeElement
+        if (embeddedTypeElement == null) {
+            messages.error("@Embedded field must be a class type.", field)
+            return
+        }
+
+        // Validate: embedded class must not have @Entity annotation (check by annotation name to avoid import conflict)
+        val hasEntityAnnotation = embeddedTypeElement.annotationMirrors.any {
+            it.annotationType.toString() == "io.objectbox.annotation.Entity"
+        }
+        if (hasEntityAnnotation) {
+            messages.error(
+                "@Embedded class '${embeddedTypeElement.simpleName}' must not be an @Entity.", field
+            )
+            return
+        }
+        val embeddedFields = ElementFilter.fieldsIn(embeddedTypeElement.enclosedElements)
+        val hasIdField = embeddedFields.any { it.hasAnnotation(Id::class.java) }
+        if (hasIdField) {
+            messages.error(
+                "@Embedded class '${embeddedTypeElement.simpleName}' must not have an @Id property.", field
+            )
+            return
+        }
+
+        // Determine prefix from @Embedded annotation mirror
+        val embeddedMirror = field.annotationMirrors.find {
+            it.annotationType.toString() == "io.objectbox.annotation.Embedded"
+        }
+        val prefixValue = embeddedMirror?.elementValues?.entries
+            ?.find { it.key.simpleName.toString() == "prefix" }
+            ?.value?.value?.toString()
+        val prefix = if (!prefixValue.isNullOrEmpty()) {
+            prefixValue
+        } else {
+            "${field.simpleName}_"
+        }
+
+        // Determine getter for the embedded object on the entity
+        val embeddedFieldName = field.simpleName.toString()
+        val isFieldAccessible = !field.modifiers.contains(Modifier.PRIVATE)
+        val embeddedFieldGetter = if (isFieldAccessible) {
+            embeddedFieldName
+        } else {
+            // Look for a getter method
+            val capName = embeddedFieldName.replaceFirstChar { it.titlecase(Locale.getDefault()) }
+            val getter = methods.find { it.simpleName.toString() == "get$capName" }
+            getter?.simpleName?.toString()?.let { "$it()" } ?: "get$capName()"
+        }
+
+        val embeddedTypeName = embeddedTypeElement.simpleName.toString()
+
+        // Flatten each field of the embedded class
+        for (embeddedField in embeddedFields) {
+            val modifiers = embeddedField.modifiers
+            if (modifiers.contains(Modifier.STATIC) || modifiers.contains(Modifier.TRANSIENT)
+                || embeddedField.hasAnnotation(Transient::class.java)
+            ) {
+                continue
+            }
+
+            val embeddedFieldType = embeddedField.asType()
+            val propertyType = typeHelper.getPropertyType(embeddedFieldType)
+            if (propertyType == null) {
+                messages.error(
+                    "Field type \"$embeddedFieldType\" in @Embedded class '${embeddedTypeName}' is not supported.",
+                    field
+                )
+                return
+            }
+
+            val flatPropertyName = prefix + embeddedField.simpleName.toString()
+            val propertyBuilder = try {
+                entityModel.addProperty(propertyType, flatPropertyName)
+            } catch (e: Exception) {
+                messages.error("Could not add embedded property: ${e.message}", field)
+                if (e is ModelException) return else throw e
+            }
+
+            // Determine getter for this property within the embedded object
+            val embPropName = embeddedField.simpleName.toString()
+            val isEmbPropAccessible = !embeddedField.modifiers.contains(Modifier.PRIVATE)
+            val embeddedPropertyGetter = if (isEmbPropAccessible) {
+                embPropName
+            } else {
+                val capEmbPropName = embPropName.replaceFirstChar { it.titlecase(Locale.getDefault()) }
+                val embGetter = ElementFilter.methodsIn(embeddedTypeElement.enclosedElements)
+                    .find { it.simpleName.toString() == "get$capEmbPropName" }
+                embGetter?.simpleName?.toString()?.let { "$it()" } ?: "get$capEmbPropName()"
+            }
+
+            // Set embedded metadata on the property
+            propertyBuilder.embeddedField(embeddedFieldName, embeddedFieldGetter, embeddedPropertyGetter, embeddedTypeName)
+
+            // Handle primitive vs non-primitive flags
+            val isPrimitive = embeddedFieldType.kind.isPrimitive
+            if (!isPrimitive && propertyType.isScalar) {
+                propertyBuilder.nonPrimitiveFlag()
+            }
+            if (isPrimitive) propertyBuilder.typeNotNull()
+
+            // Embedded flat properties are not field-accessible on the entity (they don't exist as fields)
+            // parsedElement is left null (similar to virtual properties)
         }
     }
 

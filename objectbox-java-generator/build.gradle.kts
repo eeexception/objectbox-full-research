@@ -135,6 +135,7 @@ allprojects {
 
     // Note: also update IncrementalCompilationTest.projectSetup as needed.
     repositories {
+        mavenLocal() // Before mavenCentral to pick up local @Embedded annotation changes
         mavenCentral()
         google()
         val hasInternalObjectBoxRepo: Boolean by rootProject.extra
@@ -153,7 +154,6 @@ allprojects {
                 }
             }
         }
-        mavenLocal()
     }
 
     configurations.all {

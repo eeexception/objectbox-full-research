@@ -189,6 +189,23 @@ public class Property implements HasParsedElement {
             return this;
         }
 
+        /**
+         * Sets embedded field metadata for a property that originates from an @Embedded field.
+         *
+         * @param fieldName        the field name of the embedded object in the entity (e.g. "address")
+         * @param fieldGetter      getter for the embedded object (e.g. "getAddress()")
+         * @param propertyGetter   getter for this property within the embedded object (e.g. "getStreet()")
+         * @param fieldType        simple type name of the embedded class (e.g. "Address")
+         */
+        public PropertyBuilder embeddedField(String fieldName, String fieldGetter,
+                String propertyGetter, String fieldType) {
+            property.embeddedFieldName = fieldName;
+            property.embeddedFieldGetter = fieldGetter;
+            property.embeddedPropertyGetter = propertyGetter;
+            property.embeddedFieldType = fieldType;
+            return this;
+        }
+
         public PropertyBuilder virtualTargetName(String virtualTargetName) {
             property.virtualTargetName = virtualTargetName;
             return this;
@@ -252,6 +269,18 @@ public class Property implements HasParsedElement {
     private String javaType;
     @Nullable
     private String javaRawType;
+
+    /** For embedded properties: the field name of the embedded object in the entity (e.g. "address"). */
+    private String embeddedFieldName;
+
+    /** For embedded properties: getter expression for the embedded object (e.g. "getAddress()"). */
+    private String embeddedFieldGetter;
+
+    /** For embedded properties: getter expression for this property within the embedded object (e.g. "getStreet()"). */
+    private String embeddedPropertyGetter;
+
+    /** For embedded properties: simple type name of the embedded class (e.g. "Address"). */
+    private String embeddedFieldType;
 
     /** For virtual properties, this is target host where the property actually is located (e.g. a {@link ToOne}). */
     private String virtualTargetName;
@@ -470,6 +499,27 @@ public class Property implements HasParsedElement {
 
     public String getConverterClassName() {
         return converterClassName;
+    }
+
+    /** If this property originates from an @Embedded field. */
+    public boolean isEmbedded() {
+        return embeddedFieldName != null;
+    }
+
+    public String getEmbeddedFieldName() {
+        return embeddedFieldName;
+    }
+
+    public String getEmbeddedFieldGetter() {
+        return embeddedFieldGetter;
+    }
+
+    public String getEmbeddedPropertyGetter() {
+        return embeddedPropertyGetter;
+    }
+
+    public String getEmbeddedFieldType() {
+        return embeddedFieldType;
     }
 
     /**

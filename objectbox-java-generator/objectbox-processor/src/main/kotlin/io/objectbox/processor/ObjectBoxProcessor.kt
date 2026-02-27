@@ -534,6 +534,21 @@ open class ObjectBoxProcessor : AbstractProcessor() {
                     messages.debug("Constructor param type differs: ${param.asType()} vs. ${parsedElement.asType()}")
                     return false
                 }
+            } else if (property.isEmbedded) {
+                // Embedded flat property: check constructor param name matches flat property name, type matches
+                val paramPropertyType = typeHelper.getPropertyType(param.asType())
+                if (paramPropertyType != property.propertyType) {
+                    messages.debug("Constructor param type differs (embedded property)")
+                    return false
+                }
+                if (param.simpleName.toString() != property.propertyName) {
+                    if (altName == param.simpleName.toString()) {
+                        if (debug) messages.debug("Constructor param name alternative accepted: $altName for ${property.propertyName}")
+                    } else {
+                        messages.debug("Constructor param name differs (embedded property): ${param.simpleName} vs. ${property.propertyName}")
+                        return false
+                    }
+                }
             } else {
                 // special case: virtual property (to-one target id) that has no matching field
                 val paramPropertyType = typeHelper.getPropertyType(param.asType())
