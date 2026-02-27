@@ -463,4 +463,174 @@ class ClassTransformerTest : AbstractTransformTest() {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // Nested @Embedded (P2.4-T) — two-level chain: Entity → Money → Currency.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Nested `@Embedded`: entity field → container with a SCALAR leaf AND a NESTED `@Embedded`.
+     *
+     * Chain: `EntityEmbeddedNested.price: MoneyNested{ amount, @Embedded cur: Currency{code, rate} }`
+     *
+     * Expected synthetic flat fields on the entity (all three landing at entity level, NOT split
+     * across the intermediate POJO):
+     *   - `priceAmount`   ← root-level leaf (price.amount)
+     *   - `priceCurCode`  ← nested leaf, compound prefix `priceCur` (price.cur.code)
+     *   - `priceCurRate`  ← nested leaf (price.cur.rate)
+     *
+     * A single-level transformer treats `cur` as an OPAQUE LEAF (not a container to recurse
+     * into) and computes a synthetic name `priceCur` for it. That name isn't in
+     * `EntityEmbeddedNested_`, so the cross-validation throws — giving a precise RED failure
+     * pointing at the nesting gap rather than a garbage transform.
+     *
+     * KEY NEGATIVE assertion: no `priceCur` synthetic field. The nested container is hydrated
+     * as an OBJECT via `attachEmbedded`, not flattened into a field.
+     */
+    @Test
+    fun testTransformEntity_embeddedNested_injectsAllLeafSyntheticFields() {
+        val classes = listOf(
+            EntityEmbeddedNested::class, EntityEmbeddedNested_::class,
+            MoneyNestedEmbeddable::class, CurrencyEmbeddable::class,
+        )
+        testTransformAndInspect(classes, expectedTransformed = 1, expectedCopied = 3) { stats, outDir ->
+            // Two containers discovered: root `price: Money` + nested `cur: Currency`. The
+            // counter tracks containers, not nesting depth — parent and child each count.
+            assertEquals("both root and nested containers discovered", 2, stats.embeddedContainersFound)
+            // Three LEAF synthetics: one direct (priceAmount) + two nested (priceCurCode, priceCurRate).
+            // NOT four — the nested container field `cur` itself is NOT a leaf.
+            assertEquals("three leaf synthetics (nested container field is not a leaf)",
+                3, stats.embeddedSyntheticFieldsAdded)
+
+            val ct = loadOutputCtClass(outDir, EntityEmbeddedNested::class.qualifiedName!!)
+            val byName = ct.declaredFields.associateBy { it.name }
+
+            // ── Root-level direct leaf ─────────────────────────────────────────────────────
+            val priceAmount = byName["priceAmount"]
+                ?: fail("synthetic 'priceAmount' not injected (root-level leaf). fields: ${byName.keys}") as Nothing
+            assertTrue(Modifier.isTransient(priceAmount.modifiers))
+            assertEquals("J", priceAmount.fieldInfo.descriptor)
+
+            // ── Nested leaves (compound prefix) ────────────────────────────────────────────
+            // These are the critical assertions: the transformer had to RECURSE into the
+            // nested container and COMPOUND the prefix (`price` + `cur` → `priceCur`). A
+            // single-level walk would never compute these names.
+            val priceCurCode = byName["priceCurCode"]
+                ?: fail("synthetic 'priceCurCode' not injected (nested leaf, compound prefix). fields: ${byName.keys}") as Nothing
+            assertTrue(Modifier.isTransient(priceCurCode.modifiers))
+            assertEquals("Ljava/lang/String;", priceCurCode.fieldInfo.descriptor)
+
+            val priceCurRate = byName["priceCurRate"]
+                ?: fail("synthetic 'priceCurRate' not injected (nested leaf). fields: ${byName.keys}") as Nothing
+            assertTrue(Modifier.isTransient(priceCurRate.modifiers))
+            assertEquals("J", priceCurRate.fieldInfo.descriptor)
+
+            // ── Negative: nested container is NOT a leaf ───────────────────────────────────
+            // A single-level transformer would produce `priceCur: CurrencyEmbeddable` here.
+            // Asserting its ABSENCE proves the walk distinguished "recurse into" from "flatten".
+            assertFalse(
+                "nested container 'cur' must NOT produce a synthetic entity-level field 'priceCur' " +
+                    "— it's a container to recurse into, not a leaf to flatten. fields: ${byName.keys}",
+                byName.containsKey("priceCur")
+            )
+
+            // Also: bare `cur` must not leak (would happen if a naive recursion restarted the
+            // prefix chain at the nested level instead of compounding from the parent).
+            assertFalse("nested container name 'cur' must not leak as bare synthetic", byName.containsKey("cur"))
+        }
+    }
+
+    /**
+     * Nested `@Embedded` cursor body: CHAINED hydration. The rewritten `attachEmbedded` must:
+     *
+     *   1. Hydrate + assign the ROOT container first (`$1.price = new Money(); ...`), so that
+     *      `$1.price` is non-null when step 2 derefs it.
+     *   2. Hydrate + assign the NESTED container via the ROOT's field (`$1.price.cur = new
+     *      Currency(); ...`) — NOT `$1.cur` (which would be a non-existent entity field and
+     *      would fail javac compilation of the Javassist source string).
+     *
+     * We can't assert instruction ORDER from the constant pool (it's a flat set), but we CAN
+     * assert the body references `MoneyNestedEmbeddable.cur` as a Fieldref — that's the PUTFIELD
+     * for `$1.price.cur = __emb`, proving the nested assignment walked the chain rather than
+     * flatly targeting the entity. Ordering correctness is implicitly verified by the
+     * Javassist compile succeeding (`setBody` would throw if `$1.price.cur` were unreachable).
+     */
+    @Test
+    fun testTransformCursor_embeddedNested_injectsChainedHydrationBody() {
+        val classes = listOf(
+            EntityEmbeddedNested::class, EntityEmbeddedNested_::class,
+            MoneyNestedEmbeddable::class, CurrencyEmbeddable::class,
+            EntityEmbeddedNestedCursor::class,
+        )
+        // 2 transformed (entity: 3 synthetic fields; cursor: chained hydration body),
+        // 3 copied (Entity_ + 2 container POJOs are passive).
+        testTransformAndInspect(classes, expectedTransformed = 2, expectedCopied = 3) { stats, outDir ->
+            assertEquals(2, stats.embeddedContainersFound)
+            assertEquals(3, stats.embeddedSyntheticFieldsAdded)
+            assertEquals("exactly one attachEmbedded body injected (nesting doesn't multiply cursors)",
+                1, stats.embeddedAttachBodiesInjected)
+
+            val ct = loadOutputCtClass(outDir, EntityEmbeddedNestedCursor::class.qualifiedName!!)
+            val attach = ct.declaredMethods.single {
+                it.name == "attachEmbedded" && (it.methodInfo.accessFlags and 0x0040) == 0 // !ACC_BRIDGE
+            }
+            assertTrue("attachEmbedded body must be rewritten (was ${attach.methodInfo.codeAttribute.code.size} bytes)",
+                attach.methodInfo.codeAttribute.code.size > 1)
+
+            val constPool = ct.classFile.constPool
+            val poolDump = (1 until constPool.size).mapNotNull { idx ->
+                runCatching {
+                    val cls = constPool.getFieldrefClassName(idx)
+                    val name = constPool.getFieldrefName(idx)
+                    "Fieldref: $cls.$name"
+                }.getOrElse {
+                    runCatching {
+                        val cls = constPool.getMethodrefClassName(idx)
+                        val name = constPool.getMethodrefName(idx)
+                        "Methodref: $cls.$name"
+                    }.getOrNull()
+                }
+            }
+
+            // ── Both containers instantiated ───────────────────────────────────────────────
+            assertTrue("constpool should reference MoneyNestedEmbeddable.<init> (root hydrate). was: $poolDump",
+                poolDump.any { it.endsWith("${MoneyNestedEmbeddable::class.qualifiedName}.<init>") })
+            assertTrue("constpool should reference CurrencyEmbeddable.<init> (nested hydrate). was: $poolDump",
+                poolDump.any { it.endsWith("${CurrencyEmbeddable::class.qualifiedName}.<init>") })
+
+            // ── All three synthetic flat fields read from entity ───────────────────────────
+            // Each is a GETFIELD on the entity in the hydration body (`$1.<synth>`).
+            val entityFqn = EntityEmbeddedNested::class.qualifiedName
+            assertTrue("constpool should reference $entityFqn.priceAmount. was: $poolDump",
+                poolDump.any { it.endsWith("$entityFqn.priceAmount") })
+            assertTrue("constpool should reference $entityFqn.priceCurCode. was: $poolDump",
+                poolDump.any { it.endsWith("$entityFqn.priceCurCode") })
+            assertTrue("constpool should reference $entityFqn.priceCurRate. was: $poolDump",
+                poolDump.any { it.endsWith("$entityFqn.priceCurRate") })
+
+            // ── Root container assignment target ───────────────────────────────────────────
+            // `$1.price = __emb` → PUTFIELD on EntityEmbeddedNested.price.
+            assertTrue("constpool should reference $entityFqn.price (root container assign). was: $poolDump",
+                poolDump.any { it.endsWith("$entityFqn.price") })
+
+            // ── NESTED container assignment target — THE critical nesting assertion ────────
+            // `$1.price.cur = __emb` → PUTFIELD on *MoneyNestedEmbeddable*.cur (NOT the entity).
+            // A single-level transformer would emit `$1.cur = __emb` → PUTFIELD on the ENTITY's
+            // `cur` field, which doesn't exist, so Javassist's source compilation would fail
+            // long before we got here. This assertion additionally locks the SHAPE of the
+            // correct body (parent-path deref, not flat-entity-field) for regression safety.
+            assertTrue(
+                "constpool should reference ${MoneyNestedEmbeddable::class.qualifiedName}.cur " +
+                    "(nested container assignment via parent chain, NOT flat \$1.cur). was: $poolDump",
+                poolDump.any { it.endsWith("${MoneyNestedEmbeddable::class.qualifiedName}.cur") }
+            )
+
+            // ── Inner field writes on the nested container ─────────────────────────────────
+            // `__emb.code = $1.priceCurCode;` → PUTFIELD on CurrencyEmbeddable.code.
+            assertTrue("constpool should reference CurrencyEmbeddable.code. was: $poolDump",
+                poolDump.any { it.endsWith("${CurrencyEmbeddable::class.qualifiedName}.code") })
+            assertTrue("constpool should reference CurrencyEmbeddable.rate. was: $poolDump",
+                poolDump.any { it.endsWith("${CurrencyEmbeddable::class.qualifiedName}.rate") })
+        }
+    }
+
 }

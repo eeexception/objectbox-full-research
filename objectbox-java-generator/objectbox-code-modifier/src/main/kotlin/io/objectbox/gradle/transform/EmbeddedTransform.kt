@@ -63,15 +63,48 @@ object EmbeddedTransform {
      * Per-container metadata bridge between phase A (entity transform) and phase B (cursor
      * transform). Lives in `ClassTransformer.Context`, keyed by entity FQN. Ephemeral — only
      * valid for a single `transformOrCopyClasses()` invocation.
+     *
+     * For nested `@Embedded` chains (container field annotated `@Embedded` inside ANOTHER
+     * container), each level produces one `EmbeddedContainer` instance — they form a flat list
+     * (parent-before-child — hydration order) with parent-linkage via [parent]. Each
+     * instance's [syntheticFields] holds only its DIRECT scalar leaves, not transitively-nested
+     * ones; nested leaves belong to the nested container's own entry. This keeps the cursor body
+     * builder's per-container loop uniform: it hydrates one POJO's direct fields + assigns it
+     * to its target, same whether root or nested.
      */
     data class EmbeddedContainer(
-        /** Entity-side field name, e.g. `price`. The cursor body assigns to `$1.<this>`. */
+        /** Field name on the OWNING level, e.g. `price` (root) or `cur` (nested inside Money). */
         val fieldName: String,
         /** FQN of the container POJO type, e.g. `com.example.Money`. Used in `new <this>()`. */
         val typeFqn: String,
-        /** Inner fields to flatten. Order matches declaration order in the POJO's bytecode. */
+        /** DIRECT leaf inner-fields only. Nested-container inner-fields get their OWN entry. */
         val syntheticFields: List<SyntheticField>,
-    )
+        /**
+         * Parent container for nested chains, null for root. Used by [assignmentTargetExpression]
+         * to walk the path back to `$1` (the entity). Mirrors `EmbeddedField.parent` on the
+         * generator-model side — same design, same reason: flat list + parent-ref beats nested
+         * lists when the consumer iterates flat (which the body builder does).
+         */
+        val parent: EmbeddedContainer? = null,
+    ) {
+        /**
+         * The Javassist-source LHS expression to assign this container's hydrated instance to.
+         *
+         *   Root:   `$1.price`           (direct entity field)
+         *   Nested: `$1.price.cur`       (via parent chain — PARENT'S target + `.fieldName`)
+         *   Depth-3: `$1.a.b.c`          (fully general)
+         *
+         * Why this works without an NPE at hydration time: the discovery walk emits containers
+         * PARENT-BEFORE-CHILD (depth-first, see [discoverOne]'s `listOf(self) + nestedDesc`),
+         * and [buildAttachEmbeddedBody] iterates that list in order. So by the time the nested
+         * container's block executes, its parent's block has already run `$1.price = __emb;` —
+         * guaranteeing `$1.price` is non-null when `$1.price.cur = __emb;` dereferences it.
+         *
+         * `\$1` is the Kotlin-escaped literal for Javassist's `$1` first-param placeholder.
+         */
+        fun assignmentTargetExpression(): String =
+            (parent?.assignmentTargetExpression() ?: "\$1") + "." + fieldName
+    }
 
     /**
      * One synthetic flat-field to inject onto the entity + its hydration target in the container.
@@ -95,14 +128,21 @@ object EmbeddedTransform {
     /**
      * Walks `@Embedded`-annotated fields on [ctClass], loading container types on-demand from
      * [context]'s probed-class set, and computes synthetic flat-field metadata. Validates each
-     * computed synthetic name against [entityInfoCtClass] (the `Entity_` class — REQUIRED, must
-     * be pre-loaded into the pool by the caller's `makeCtClass` pass).
+     * computed synthetic name against the `Entity_` class (REQUIRED, must be pre-loaded into
+     * the pool by the caller's `makeCtClass` pass).
+     *
+     * Recursively descends into nested `@Embedded` fields on container POJOs, compounding
+     * prefixes at each level. Returns a FLAT list of all containers (root and nested), ordered
+     * depth-first PARENT-BEFORE-CHILD — this ordering is a contract that
+     * [buildAttachEmbeddedBody] relies on (parent must be hydrated+assigned before nested derefs
+     * it via `$1.price.cur = ...`).
      *
      * Does NOT mutate [ctClass] — that's [injectEmbeddedSyntheticFields]'s job. Split so the
      * metadata can be stashed on the Context even if injection is skipped (e.g. re-run on an
      * already-transformed class where fields already exist).
      *
-     * @throws TransformException on missing `Entity_`, missing container POJO, or name mismatch.
+     * @throws TransformException on missing `Entity_`, missing container POJO, name mismatch,
+     *   or `@Embedded` type cycle (A embeds B embeds A, or A embeds A).
      */
     fun discoverEmbeddedContainers(
         context: ClassTransformer.Context,
@@ -111,37 +151,161 @@ object EmbeddedTransform {
     ): List<EmbeddedContainer> {
         val entityInfoCtClass = requireEntityInfoInPool(context, ctClass)
 
+        // Top level: walk entity fields, dispatch each @Embedded-annotated one into the
+        // recursive walker. Each root can yield MULTIPLE containers (self + nested descendants),
+        // hence flatMap.
         return ctClass.declaredFields
+            .asSequence()
             .mapNotNull { field ->
                 val ann = field.fieldInfo.exGetAnnotation(ClassConst.embeddedAnnotationName) ?: return@mapNotNull null
-                // Not filtering on transient/static here — APT would have rejected those
-                // configurations already. If the bytecode somehow has `@Embedded transient`,
-                // we still want to process it (the transient modifier on the CONTAINER doesn't
-                // affect flat-field injection; it only affects Java serialization of the POJO ref).
+                field to ann
+            }
+            .flatMap { (field, ann) ->
+                discoverOne(
+                    context = context,
+                    entityInfoCtClass = entityInfoCtClass,
+                    ownerFqn = ctClass.name,
+                    field = field.fieldInfo,
+                    embeddedAnn = ann,
+                    parentEffectivePrefix = "",   // no parent → local prefix IS the effective prefix
+                    parentContainer = null,       // root level
+                    visitedTypes = emptySet(),    // fresh cycle-detection path per root
+                    debug = debug,
+                ).asSequence()
+            }
+            .toList()
+    }
 
-                val containerTypeFqn = descriptorToJavaType(field.fieldInfo.descriptor)
-                val containerCtClass = loadContainerType(context, containerTypeFqn, ctClass.name, field.name)
-                val resolvedPrefix = resolvePrefix(ann, field.name)
+    /**
+     * Recursive discovery for ONE `@Embedded` field (root or nested). Returns self +
+     * all nested descendants, parent-first.
+     *
+     * Algorithm (mirrors the APT's recursive `parseEmbedded()`):
+     *   1. Resolve this level's LOCAL prefix (USE_FIELD_NAME → field name; else literal).
+     *   2. COMPOUND with parent's effective prefix → this level's effective prefix.
+     *   3. Load container type; cycle-check its FQN against the visited-path set.
+     *   4. Partition inner fields: `@Embedded` inner fields become PENDING nested containers
+     *      (recursed AFTER self is constructed); scalar inner fields become DIRECT leaf
+     *      [SyntheticField]s with compound-prefixed names.
+     *   5. Construct SELF with direct leaves; pass SELF as `parent` into each pending recurse.
+     *   6. Return `[self] + allNestedDescendants` — parent-first ordering contract.
+     *
+     * The construct-self-before-recurse sequencing is important: nested containers need a
+     * parent ref, but we need the DIRECT-leaf list (which excludes nested-container inner
+     * fields) to construct self. Solution: collect pending nesteds during the inner-field walk,
+     * then recurse into them AFTER self is built. Nested descendants never mutate self's
+     * synthetics list — their leaves belong to their own `EmbeddedContainer` entry.
+     *
+     * @param ownerFqn FQN of whatever DECLARES [field] — the entity for root, the parent
+     *   container type for nested. Used only for error messages (so a user sees the full
+     *   `Owner.field` path in diagnostics).
+     * @param parentEffectivePrefix Already-compounded prefix from all ancestor levels. Empty
+     *   string at root (NOT null — we've concretized USE_FIELD_NAME sentinel already).
+     * @param visitedTypes Set of container-type FQNs on the CURRENT descent path. Passed as an
+     *   immutable copy at each recurse (`visitedTypes + thisTypeFqn`) so sibling branches get
+     *   the same parent view — no mutable add/remove bookkeeping. Siblings of the same type
+     *   (e.g. `@Embedded Money m1; @Embedded Money m2;` inside one container) are legal and
+     *   NOT a cycle — only ancestor reappearance is.
+     */
+    private fun discoverOne(
+        context: ClassTransformer.Context,
+        entityInfoCtClass: CtClass,
+        ownerFqn: String,
+        field: FieldInfo,
+        embeddedAnn: javassist.bytecode.annotation.Annotation,
+        parentEffectivePrefix: String,
+        parentContainer: EmbeddedContainer?,
+        visitedTypes: Set<String>,
+        debug: Boolean,
+    ): List<EmbeddedContainer> {
+        // ── 1 + 2. Prefix resolution + compounding ──────────────────────────────────────────
+        // Local prefix: USE_FIELD_NAME sentinel → field name; else the literal annotation value.
+        // Effective prefix: parent's effective prefix compounded with our local.
+        //   parent "" + local "price" → "price"          (root, default)
+        //   parent "price" + local "cur" → "priceCur"    (nested, default)
+        //   parent "price" + local "" → "price"          (nested explicit-empty: inherits parent)
+        //   parent "" + local "" → ""                    (both empty → bare inner names)
+        // This MUST match the APT's `parentEmbedded?.syntheticNameFor(localPrefix) ?: localPrefix`
+        // exactly — the Entity_ cross-validation below catches drift.
+        val localPrefix = resolveLocalPrefix(embeddedAnn, field.name)
+        val effectivePrefix = compoundPrefix(parentEffectivePrefix, localPrefix)
 
-                if (debug) log("@Embedded ${ctClass.simpleName}.${field.name}: container=$containerTypeFqn prefix='${resolvedPrefix ?: "<field-name>"}'")
+        // ── 3. Container type + cycle check ─────────────────────────────────────────────────
+        val containerTypeFqn = descriptorToJavaType(field.descriptor)
+        if (containerTypeFqn in visitedTypes) {
+            // The APT would have caught this first (and blocked the build), so hitting this
+            // in practice means either an APT bypass or a version skew. Fail loud anyway —
+            // infinite recursion here would OOM the Gradle daemon which is a worse UX than
+            // a clear error message.
+            throw TransformException(
+                "@Embedded cycle detected in bytecode transform: '$containerTypeFqn' embeds itself " +
+                    "(directly or transitively) via '$ownerFqn.${field.name}'. The annotation " +
+                    "processor should have rejected this — check for stale build outputs."
+            )
+        }
+        val containerCtClass = loadContainerType(context, containerTypeFqn, ownerFqn, field.name)
 
-                val synthetics = enumerateInnerFields(containerCtClass)
-                    .map { inner ->
-                        val synthName = applySyntheticName(resolvedPrefix, field.name, inner.name)
-                        validateSyntheticNameInEntityInfo(entityInfoCtClass, synthName, ctClass.name, field.name, inner.name)
-                        SyntheticField(
-                            name = synthName,
-                            innerFieldName = inner.name,
-                            javaType = descriptorToJavaType(inner.descriptor),
-                        )
-                    }
+        if (debug) {
+            val depth = generateSequence(parentContainer) { it.parent }.count()
+            log("@Embedded${"  ".repeat(depth)} $ownerFqn.${field.name}: container=$containerTypeFqn effectivePrefix='$effectivePrefix'")
+        }
 
-                EmbeddedContainer(
-                    fieldName = field.name,
-                    typeFqn = containerTypeFqn,
-                    syntheticFields = synthetics,
+        // ── 4. Inner-field walk: partition into direct-leaves vs pending-nesteds ────────────
+        // We can't recurse IN-LOOP because nested containers need `self` as their parent ref,
+        // and `self` isn't constructed until we have the full direct-leaf list. So: collect
+        // pending nesteds (field + annotation pair — need both for the recurse call), finish
+        // the leaf walk, construct self, THEN recurse into pendings with self as parent.
+        val directLeaves = mutableListOf<SyntheticField>()
+        val pendingNested = mutableListOf<Pair<FieldInfo, javassist.bytecode.annotation.Annotation>>()
+
+        for (inner in enumerateInnerFields(containerCtClass)) {
+            val nestedAnn = inner.exGetAnnotation(ClassConst.embeddedAnnotationName)
+            if (nestedAnn != null) {
+                // Nested @Embedded — defer recursion. NOT a leaf; produces no SyntheticField on
+                // THIS container. Its leaves will be on its OWN EmbeddedContainer entry.
+                pendingNested += inner to nestedAnn
+            } else {
+                // Scalar leaf — flatten with the compound effective prefix.
+                val synthName = syntheticNameFor(effectivePrefix, inner.name)
+                validateSyntheticNameInEntityInfo(
+                    entityInfoCtClass, synthName, ownerFqn, field.name, inner.name
+                )
+                directLeaves += SyntheticField(
+                    name = synthName,
+                    innerFieldName = inner.name,
+                    javaType = descriptorToJavaType(inner.descriptor),
                 )
             }
+        }
+
+        // ── 5. Construct self; it's safe to use as a parent ref now (nested containers only
+        //        read parent.fieldName + parent.parent for the assignment chain — neither cares
+        //        about direct-leaf contents). ────────────────────────────────────────────────
+        val self = EmbeddedContainer(
+            fieldName = field.name,
+            typeFqn = containerTypeFqn,
+            syntheticFields = directLeaves,
+            parent = parentContainer,
+        )
+
+        // ── 6. Recurse into pendings with self as parent; concat self-first for ordering ────
+        val nestedDescendants = pendingNested.flatMap { (innerField, innerAnn) ->
+            discoverOne(
+                context = context,
+                entityInfoCtClass = entityInfoCtClass,
+                ownerFqn = containerTypeFqn,   // diagnostics: owner of the NESTED field is THIS container type
+                field = innerField,
+                embeddedAnn = innerAnn,
+                parentEffectivePrefix = effectivePrefix,
+                parentContainer = self,
+                visitedTypes = visitedTypes + containerTypeFqn, // extend path for cycle check
+                debug = debug,
+            )
+        }
+
+        // Parent-first ordering — see EmbeddedContainer.assignmentTargetExpression() kdoc
+        // for why hydration depends on this.
+        return listOf(self) + nestedDescendants
     }
 
     /**
@@ -217,6 +381,10 @@ object EmbeddedTransform {
      *  - Direct field access (`__emb.currency`) not setters — matches the APT's write-path which
      *    also uses direct access via the hoisted `__emb_price.currency`. If APT ever switches to
      *    getter/setter dispatch for embedded, both halves change together.
+     *  - Nested `@Embedded` chains: [containers] is flat, parent-before-child (per
+     *    [discoverEmbeddedContainers]). The parent's block runs first → `$1.price` is non-null
+     *    when the nested block assigns `$1.price.cur = __emb`. [EmbeddedContainer.assignmentTargetExpression]
+     *    builds the `$1.price.cur` path by walking the parent chain.
      */
     fun buildAttachEmbeddedBody(containers: List<EmbeddedContainer>): String = buildString {
         append("{")
@@ -227,7 +395,10 @@ object EmbeddedTransform {
             c.syntheticFields.forEach { sf ->
                 append("__emb.${sf.innerFieldName} = \$1.${sf.name};")
             }
-            append("\$1.${c.fieldName} = __emb;")
+            // Root → `$1.price = __emb;`, nested → `$1.price.cur = __emb;` — the model method
+            // walks the parent chain so this line works uniformly at any depth. Ordering
+            // contract (parent-first list iteration) guarantees the parent deref is safe here.
+            append("${c.assignmentTargetExpression()} = __emb;")
             append("}")
         }
         append("}")
@@ -265,50 +436,59 @@ object EmbeddedTransform {
         }
     }
 
+    // ── Prefix helpers ──────────────────────────────────────────────────────────────────────
+    // The single-level impl used a String?-returning resolver (null = USE_FIELD_NAME signal) +
+    // a 3-branch name-apply. That doesn't compose for nesting — you can't cleanly chain "null"
+    // through a compound. The refactored trio below instead CONCRETIZES the sentinel early
+    // (USE_FIELD_NAME → field name) so every downstream helper works in plain strings, and
+    // compounding reduces to the same `syntheticNameFor` rule the APT's `EmbeddedField` uses.
+    //
+    // The THREE helpers are intentionally all the same shape: `"" → identity, else prefix +
+    // capFirst`. That's not coincidence — compound-prefix and leaf-name-derivation are the
+    // SAME operation applied at different levels (parent-to-child vs container-to-leaf). The
+    // APT's `EmbeddedField.syntheticNameFor` is used for both, and we mirror that symmetry.
+
     /**
-     * Resolves the `@Embedded.prefix` attribute to a concrete prefix string, or `null` to signal
-     * "derive from field name" (the `USE_FIELD_NAME` sentinel behaviour).
+     * Resolves `@Embedded.prefix` to a CONCRETE prefix string — no null-signaling.
      *
-     * Bytecode-level subtlety: `@Embedded` with NO explicit `prefix` omits the member from the
-     * annotation's attribute bytes entirely — `getMemberValue("prefix")` returns null. `@Embedded(
-     * prefix="\0")` (the sentinel, spelled out) includes it with value `"\0"`. Both mean the same
-     * thing: use the field name. `@Embedded(prefix="")` includes it with value `""` — a REAL
-     * empty prefix, distinct from the sentinel.
-     *
-     * Returns:
-     *  - `null` → caller should use the entity field name as prefix (e.g. `price` → `priceCurrency`)
-     *  - `""`   → no prefix: bare inner names (e.g. `currency`)
-     *  - `"x"`  → literal prefix (e.g. `xCurrency`)
+     * Bytecode-level subtlety preserved from the old helper: `@Embedded` with NO explicit
+     * `prefix` omits the member from the annotation's attribute bytes (`getMemberValue`
+     * returns null). `@Embedded(prefix="\0")` (explicit sentinel) includes it with value
+     * `"\0"`. Both → USE_FIELD_NAME → return [fieldName]. `@Embedded(prefix="")` includes
+     * it with value `""` → return `""` (real empty prefix, distinct from the sentinel).
      */
-    private fun resolvePrefix(
+    private fun resolveLocalPrefix(
         embeddedAnn: javassist.bytecode.annotation.Annotation,
-        @Suppress("UNUSED_PARAMETER") fieldName: String, // kept for symmetry with APT, may need it for diagnostics
-    ): String? {
+        fieldName: String,
+    ): String {
         val rawPrefix = (embeddedAnn.getMemberValue("prefix") as? StringMemberValue)?.value
-        return when {
-            // Member absent OR explicit sentinel → "derive from field name" signal.
-            rawPrefix == null || rawPrefix == ClassConst.embeddedPrefixUseFieldName -> null
-            // Empty or any other literal → use as-is. Caller handles the "" case in applySyntheticName.
-            else -> rawPrefix
+        return if (rawPrefix == null || rawPrefix == ClassConst.embeddedPrefixUseFieldName) {
+            fieldName  // USE_FIELD_NAME sentinel → concretize to the field name
+        } else {
+            rawPrefix  // "" or explicit "x" — literal
         }
     }
 
     /**
-     * Computes the synthetic flat-field name. MUST match the APT's `parseEmbedded()` exactly —
-     * cross-validated against `Entity_` downstream, so a drift here manifests as a build failure
-     * (which is the intended fail-loud behaviour, not a silent runtime mismatch).
-     *
-     * Rules (mirroring `objectbox-processor/Properties.kt:parseEmbedded()`):
-     *  - resolvedPrefix == null (USE_FIELD_NAME) → `<fieldName> + capFirst(<inner>)` → `priceCurrency`
-     *  - resolvedPrefix == ""                    → `<inner>` as-is                    → `currency`
-     *  - resolvedPrefix == "x"                   → `x + capFirst(<inner>)`            → `xCurrency`
+     * Compounds a child's local prefix under a parent's effective prefix.
+     * Mirrors the APT's `parentEmbedded.syntheticNameFor(localPrefix)` — the empty-parent
+     * short-circuit makes all four empty/non-empty parent×child combos work:
+     *   `compound("", "price") → "price"`, `compound("price", "cur") → "priceCur"`,
+     *   `compound("price", "") → "price"`, `compound("", "") → ""`.
      */
-    private fun applySyntheticName(resolvedPrefix: String?, fieldName: String, innerFieldName: String): String =
-        when {
-            resolvedPrefix == null   -> fieldName + capFirst(innerFieldName)
-            resolvedPrefix.isEmpty() -> innerFieldName
-            else                     -> resolvedPrefix + capFirst(innerFieldName)
-        }
+    private fun compoundPrefix(parentEffective: String, childLocal: String): String =
+        if (parentEffective.isEmpty()) childLocal
+        else if (childLocal.isEmpty()) parentEffective
+        else parentEffective + capFirst(childLocal)
+
+    /**
+     * Final synthetic flat-field name from an effective prefix + a leaf's inner-field name.
+     * MUST match the APT's `EmbeddedField.syntheticNameFor()` exactly — cross-validated against
+     * `Entity_` so drift is a build failure, not a silent runtime mismatch.
+     */
+    private fun syntheticNameFor(effectivePrefix: String, innerFieldName: String): String =
+        if (effectivePrefix.isEmpty()) innerFieldName
+        else effectivePrefix + capFirst(innerFieldName)
 
     // Character.toUpperCase rather than Char.uppercaseChar() — the latter is @ExperimentalStdlibApi
     // at Kotlin API level 1.4 (which this module is pinned to; see the build.gradle apiVersion).

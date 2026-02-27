@@ -254,6 +254,76 @@ object EntityEmbeddedNoPrefix_ : EntityInfo<EntityEmbeddedNoPrefix>, EntityInfoS
     @JvmField val amount = Property<EntityEmbeddedNoPrefix>(null, 2, 3, Long::class.javaPrimitiveType, "amount")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// Nested @Embedded fixtures (P2.4-T) — two-level chain: Entity → Money → Currency.
+// Tests compound-prefix flattening + parent-before-child hydration ordering.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Innermost POJO in the nested chain. Pure leaf fields — no further `@Embedded`. The
+ * transformer's recursive walk bottoms out here.
+ */
+class CurrencyEmbeddable {
+    @JvmField var code: String? = null
+    @JvmField var rate: Long = 0L
+}
+
+/**
+ * Middle POJO: one direct scalar leaf (`amount`) PLUS one nested `@Embedded` (`cur`).
+ *
+ * The transformer must treat `cur` as a CONTAINER-to-recurse-into, NOT as a leaf to
+ * flatten. A single-level implementation would incorrectly try to produce a synthetic
+ * field `priceCur: CurrencyEmbeddable` (i.e. treat the nested POJO as an opaque property
+ * type) and would then fail cross-validation against `EntityEmbeddedNested_` — which is
+ * the desired RED behaviour before the recursion is implemented.
+ */
+class MoneyNestedEmbeddable {
+    @JvmField var amount: Long = 0L
+    @Embedded
+    @JvmField var cur: CurrencyEmbeddable? = null
+}
+
+/**
+ * Entity with a 2-level nested chain. After transform, should have THREE synthetic
+ * transient fields (one direct leaf + two nested leaves), all on the entity:
+ *
+ *   `priceAmount: long`       ← root-level leaf  (price.amount)
+ *   `priceCurCode: String`    ← nested leaf      (price.cur.code)
+ *   `priceCurRate: long`      ← nested leaf      (price.cur.rate)
+ *
+ * Compound-prefix rule: root `price` + nested `cur` → effective prefix `priceCur`, then
+ * `priceCur` + leaf `code` → `priceCurCode`. MUST match what the APT produced — the
+ * `Entity_` cross-validation below locks the expected names.
+ */
+@Entity
+class EntityEmbeddedNested {
+    @Embedded
+    @JvmField var price: MoneyNestedEmbeddable? = null
+}
+
+/**
+ * EntityInfo with the APT's compound-flattened synthetic names. A transformer that
+ * doesn't recurse will compute `priceCur` (treating `cur` as a leaf), fail to find it
+ * here, and throw the naming-mismatch error — proving RED.
+ */
+object EntityEmbeddedNested_ : EntityInfo<EntityEmbeddedNested>, EntityInfoStub<EntityEmbeddedNested>() {
+    @JvmField val priceAmount = Property<EntityEmbeddedNested>(null, 1, 2, Long::class.javaPrimitiveType, "priceAmount")
+    @JvmField val priceCurCode = Property<EntityEmbeddedNested>(null, 2, 3, String::class.java, "priceCurCode")
+    @JvmField val priceCurRate = Property<EntityEmbeddedNested>(null, 3, 4, Long::class.javaPrimitiveType, "priceCurRate")
+}
+
+/**
+ * Cursor stub for the nested entity. The transformer must inject a CHAINED hydration body:
+ * root container hydrated + assigned FIRST (so `$1.price` is non-null), then nested container
+ * hydrated + assigned via `$1.price.cur = __emb` (not `$1.cur = __emb` — `cur` is NOT a field
+ * on the entity, it's on the intermediate POJO).
+ */
+class EntityEmbeddedNestedCursor : Cursor<EntityEmbeddedNested>(null, 0, null, null) {
+    override fun getId(entity: EntityEmbeddedNested): Long = throw NotImplementedError("Stub for testing")
+    override fun put(entity: EntityEmbeddedNested): Long = throw NotImplementedError("Stub for testing")
+    override fun attachEmbedded(entity: EntityEmbeddedNested?) {}
+}
+
 open class EntityInfoStub<T> : EntityInfo<T> {
     override fun getEntityName(): String = throw NotImplementedError("Stub for testing")
     override fun getDbName(): String = throw NotImplementedError("Stub for testing")
