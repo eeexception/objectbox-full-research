@@ -42,6 +42,11 @@ public class NonArgConstructorTest extends AbstractObjectBoxTest {
         entityBuilder.flags(EntityFlags.USE_NO_ARG_CONSTRUCTOR);
     }
 
+    @Override
+    protected boolean includeEmbeddedProperties() {
+        return false; // USE_NO_ARG_CONSTRUCTOR sets fields by name; embedded flat properties aren't direct fields
+    }
+
     @Test
     public void testPutAndGet() {
         TestEntity entity = new TestEntity();

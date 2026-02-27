@@ -127,6 +127,16 @@ public final class TestEntity_ implements EntityInfo<TestEntity> {
     public final static io.objectbox.Property<TestEntity> date =
             new io.objectbox.Property<>(__INSTANCE, 24, 24, java.util.Date.class, "date");
 
+    // Flattened from @Embedded Address
+    public final static io.objectbox.Property<TestEntity> address_street =
+            new io.objectbox.Property<>(__INSTANCE, 25, 25, String.class, "address_street");
+
+    public final static io.objectbox.Property<TestEntity> address_city =
+            new io.objectbox.Property<>(__INSTANCE, 26, 27, String.class, "address_city");
+
+    public final static io.objectbox.Property<TestEntity> address_zip =
+            new io.objectbox.Property<>(__INSTANCE, 27, 28, int.class, "address_zip");
+
     @SuppressWarnings("unchecked")
     public final static io.objectbox.Property<TestEntity>[] __ALL_PROPERTIES = new io.objectbox.Property[]{
             id,
@@ -153,7 +163,10 @@ public final class TestEntity_ implements EntityInfo<TestEntity> {
             longArray,
             floatArray,
             doubleArray,
-            date
+            date,
+            address_street,
+            address_city,
+            address_zip
     };
 
     public final static io.objectbox.Property<TestEntity> __ID_PROPERTY = id;

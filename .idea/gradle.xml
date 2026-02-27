@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="GradleSettings">
+    <option name="linkedExternalProjectsSettings">
+      <GradleProjectSettings>
+        <compositeConfiguration>
+          <compositeBuild compositeDefinitionSource="SCRIPT">
+            <builds>
+              <build path="$PROJECT_DIR$/objectbox-java/buildSrc" name="buildSrc">
+                <projects>
+                  <project path="$PROJECT_DIR$/objectbox-java/buildSrc" />
+                </projects>
+              </build>
+            </builds>
+          </compositeBuild>
+        </compositeConfiguration>
+        <option name="externalProjectPath" value="$PROJECT_DIR$/objectbox-java" />
+        <option name="modules">
+          <set>
+            <option value="$PROJECT_DIR$/objectbox-java" />
+            <option value="$PROJECT_DIR$/objectbox-java/buildSrc" />
+            <option value="$PROJECT_DIR$/objectbox-java/objectbox-java" />
+            <option value="$PROJECT_DIR$/objectbox-java/objectbox-java-api" />
+            <option value="$PROJECT_DIR$/objectbox-java/objectbox-kotlin" />
+            <option value="$PROJECT_DIR$/objectbox-java/objectbox-rxjava" />
+            <option value="$PROJECT_DIR$/objectbox-java/objectbox-rxjava3" />
+            <option value="$PROJECT_DIR$/objectbox-java/tests" />
+            <option value="$PROJECT_DIR$/objectbox-java/tests/objectbox-java-test" />
+            <option value="$PROJECT_DIR$/objectbox-java/tests/test-proguard" />
+          </set>
+        </option>
+      </GradleProjectSettings>
+      <GradleProjectSettings>
+        <compositeConfiguration>
+          <compositeBuild compositeDefinitionSource="SCRIPT">
+            <builds>
+              <build path="$PROJECT_DIR$/objectbox-java-generator/buildSrc" name="buildSrc">
+                <projects>
+                  <project path="$PROJECT_DIR$/objectbox-java-generator/buildSrc" />
+                </projects>
+              </build>
+            </builds>
+          </compositeBuild>
+        </compositeConfiguration>
+        <option name="externalProjectPath" value="$PROJECT_DIR$/objectbox-java-generator" />
+        <option name="modules">
+          <set>
+            <option value="$PROJECT_DIR$/objectbox-java-generator" />
+            <option value="$PROJECT_DIR$/objectbox-java-generator/agp-wrapper-7-2" />
+            <option value="$PROJECT_DIR$/objectbox-java-generator/buildSrc" />
+            <option value="$PROJECT_DIR$/objectbox-java-generator/objectbox-code-modifier" />
+            <option value="$PROJECT_DIR$/objectbox-java-generator/objectbox-generator" />
+            <option value="$PROJECT_DIR$/objectbox-java-generator/objectbox-gradle-plugin" />
+            <option value="$PROJECT_DIR$/objectbox-java-generator/objectbox-processor" />
+          </set>
+        </option>
+      </GradleProjectSettings>
+    </option>
+  </component>
+</project>

@@ -21,6 +21,7 @@ import java.util.Map;
 import io.objectbox.annotation.apihint.Internal;
 import io.objectbox.converter.FlexObjectConverter;
 import io.objectbox.converter.StringFlexMapConverter;
+import io.objectbox.embedded.Address;
 import io.objectbox.internal.CursorFactory;
 
 // NOTE: Instead of updating this by hand, copy changes from the internal integration test project after updating its
@@ -74,6 +75,9 @@ public final class TestEntityCursor extends Cursor<TestEntity> {
     private final static int __ID_floatArray = TestEntity_.floatArray.id;
     private final static int __ID_doubleArray = TestEntity_.doubleArray.id;
     private final static int __ID_date = TestEntity_.date.id;
+    private final static int __ID_address_street = TestEntity_.address_street.id;
+    private final static int __ID_address_city = TestEntity_.address_city.id;
+    private final static int __ID_address_zip = TestEntity_.address_zip.id;
 
     public TestEntityCursor(io.objectbox.Transaction tx, long cursor, BoxStore boxStore) {
         super(tx, cursor, TestEntity_.__INSTANCE, boxStore);
@@ -92,6 +96,15 @@ public final class TestEntityCursor extends Cursor<TestEntity> {
     @SuppressWarnings({"rawtypes", "unchecked"})
     @Override
     public long put(TestEntity entity) {
+        // Extract embedded Address fields (null-guard the embedded object)
+        Address address = entity.getAddress();
+        String address_street = address != null ? address.getStreet() : null;
+        int __id_address_street = address_street != null ? __ID_address_street : 0;
+        String address_city = address != null ? address.getCity() : null;
+        int __id_address_city = address_city != null ? __ID_address_city : 0;
+        int address_zip = address != null ? address.getZip() : 0;
+        int __id_address_zip = address != null ? __ID_address_zip : 0;
+
         boolean[] booleanArray = entity.getBooleanArray();
         int __id17 = booleanArray != null ? __ID_booleanArray : 0;
 
@@ -156,8 +169,8 @@ public final class TestEntityCursor extends Cursor<TestEntity> {
         int __id16 = flexProperty != null ? __ID_flexProperty : 0;
 
         collect430000(cursor, 0, 0,
-                __id8, simpleString, 0, null,
-                0, null, 0, null,
+                __id8, simpleString, __id_address_street, address_street,
+                __id_address_city, address_city, 0, null,
                 __id9, simpleByteArray, __id15, __id15 != 0 ? stringObjectMapConverter.convertToDatabaseValue(stringObjectMap) : null,
                 __id16, __id16 != 0 ? flexPropertyConverter.convertToDatabaseValue(flexProperty) : null);
 
@@ -174,7 +187,7 @@ public final class TestEntityCursor extends Cursor<TestEntity> {
 
         long __assignedId = collect004000(cursor, entity.getId(), PUT_FLAG_COMPLETE,
                 __ID_simpleShortU, entity.getSimpleShortU(), __ID_simpleByte, entity.getSimpleByte(),
-                __ID_simpleBoolean, entity.getSimpleBoolean() ? 1 : 0, 0, 0);
+                __ID_simpleBoolean, entity.getSimpleBoolean() ? 1 : 0, __id_address_zip, address_zip);
 
         entity.setId(__assignedId);
 

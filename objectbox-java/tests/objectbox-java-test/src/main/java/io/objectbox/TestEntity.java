@@ -23,9 +23,11 @@ import java.util.Map;
 
 import javax.annotation.Nullable;
 
+import io.objectbox.annotation.Embedded;
 import io.objectbox.annotation.Entity;
 import io.objectbox.annotation.Id;
 import io.objectbox.annotation.Unsigned;
+import io.objectbox.embedded.Address;
 
 /**
  * The annotations in this class have no effect as the Gradle plugin is not configured in this project. They are
@@ -75,6 +77,9 @@ public class TestEntity {
     private double[] doubleArray;
     private Date date;
 
+    @Embedded
+    private Address address;
+
     transient boolean noArgsConstructorCalled;
 
     public TestEntity() {
@@ -109,7 +114,10 @@ public class TestEntity {
                       long[] longArray,
                       float[] floatArray,
                       double[] doubleArray,
-                      Date date
+                      Date date,
+                      String address_street,
+                      String address_city,
+                      int address_zip
     ) {
         this.id = id;
         this.simpleBoolean = simpleBoolean;
@@ -136,6 +144,9 @@ public class TestEntity {
         this.floatArray = floatArray;
         this.doubleArray = doubleArray;
         this.date = date;
+        if (address_street != null || address_city != null || address_zip != 0) {
+            this.address = new Address(address_street, address_city, address_zip);
+        }
         if (STRING_VALUE_THROW_IN_CONSTRUCTOR.equals(simpleString)) {
             throw new RuntimeException(EXCEPTION_IN_CONSTRUCTOR_MESSAGE);
         }
@@ -352,6 +363,15 @@ public class TestEntity {
 
     public void setDate(Date date) {
         this.date = date;
+    }
+
+    @Nullable
+    public Address getAddress() {
+        return address;
+    }
+
+    public void setAddress(@Nullable Address address) {
+        this.address = address;
     }
 
     @Override

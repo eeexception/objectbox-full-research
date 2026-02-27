@@ -41,6 +41,7 @@ import javax.annotation.Nullable;
 import io.objectbox.ModelBuilder.EntityBuilder;
 import io.objectbox.ModelBuilder.PropertyBuilder;
 import io.objectbox.annotation.IndexType;
+import io.objectbox.embedded.Address;
 import io.objectbox.config.DebugFlags;
 import io.objectbox.model.PropertyFlags;
 import io.objectbox.model.PropertyType;
@@ -306,7 +307,16 @@ public abstract class AbstractObjectBoxTest {
 
         // Date property
         entityBuilder.property("date", PropertyType.Date).id(TestEntity_.date.id, ++lastUid);
+
         int lastId = TestEntity_.date.id;
+
+        // Flattened @Embedded Address properties (skipped in USE_NO_ARG_CONSTRUCTOR mode)
+        if (includeEmbeddedProperties()) {
+            entityBuilder.property("address_street", PropertyType.String).id(TestEntity_.address_street.id, ++lastUid);
+            entityBuilder.property("address_city", PropertyType.String).id(TestEntity_.address_city.id, ++lastUid);
+            entityBuilder.property("address_zip", PropertyType.Int).id(TestEntity_.address_zip.id, ++lastUid);
+            lastId = TestEntity_.address_zip.id;
+        }
 
         entityBuilder.lastPropertyId(lastId, lastUid);
         addOptionalFlagsToTestEntity(entityBuilder);
@@ -314,6 +324,14 @@ public abstract class AbstractObjectBoxTest {
     }
 
     protected void addOptionalFlagsToTestEntity(EntityBuilder entityBuilder) {
+    }
+
+    /**
+     * Override to return {@code false} for tests using {@code USE_NO_ARG_CONSTRUCTOR},
+     * which cannot handle flattened embedded properties (JNI sets fields by name).
+     */
+    protected boolean includeEmbeddedProperties() {
+        return true;
     }
 
     private void addTestEntityMinimal(ModelBuilder modelBuilder, boolean withIndex) {
@@ -369,6 +387,7 @@ public abstract class AbstractObjectBoxTest {
         entity.setFloatArray(new float[]{-simpleFloat, simpleFloat});
         entity.setDoubleArray(new double[]{-simpleDouble, simpleDouble});
         entity.setDate(new Date(simpleLong));
+        entity.setAddress(new Address("Street " + nr, "City " + nr, 10000 + nr));
         return entity;
     }
 

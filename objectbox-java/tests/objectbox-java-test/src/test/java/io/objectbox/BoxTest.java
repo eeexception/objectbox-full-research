@@ -26,6 +26,9 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 
+import io.objectbox.embedded.Address;
+import io.objectbox.query.Query;
+
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -89,6 +92,12 @@ public class BoxTest extends AbstractObjectBoxTest {
         assertArrayEquals(new float[]{-valFloat, valFloat}, entityRead.getFloatArray(), 0);
         assertArrayEquals(new double[]{-valDouble, valDouble}, entity.getDoubleArray(), 0);
         assertEquals(new Date(1000 + simpleInt), entity.getDate());
+
+        // Embedded Address
+        assertNotNull(entityRead.getAddress());
+        assertEquals("Street " + simpleInt, entityRead.getAddress().getStreet());
+        assertEquals("City " + simpleInt, entityRead.getAddress().getCity());
+        assertEquals(10000 + simpleInt, entityRead.getAddress().getZip());
     }
 
     @Test
@@ -120,6 +129,7 @@ public class BoxTest extends AbstractObjectBoxTest {
         assertNull(defaultEntity.getFloatArray());
         assertNull(defaultEntity.getDoubleArray());
         assertNull(defaultEntity.getDate());
+        assertNull(defaultEntity.getAddress());
     }
 
     // Note: There is a similar test using the Cursor API directly (which is deprecated) in CursorTest.
@@ -411,6 +421,73 @@ public class BoxTest extends AbstractObjectBoxTest {
 
         box.removeAll();
         assertTrue(box.isEmpty());
+    }
+
+    // ===== Embedded Address tests =====
+
+    @Test
+    public void testPutAndGet_withEmbeddedAddress() {
+        TestEntity entity = new TestEntity();
+        entity.setSimpleString("embedded-test");
+        entity.setAddress(new Address("Main St 1", "Berlin", 10115));
+        long id = box.put(entity);
+
+        TestEntity read = box.get(id);
+        assertNotNull(read);
+        assertNotNull(read.getAddress());
+        assertEquals("Main St 1", read.getAddress().getStreet());
+        assertEquals("Berlin", read.getAddress().getCity());
+        assertEquals(10115, read.getAddress().getZip());
+    }
+
+    @Test
+    public void testPutAndGet_nullEmbeddedAddress() {
+        TestEntity entity = new TestEntity();
+        entity.setSimpleString("no-address");
+        entity.setAddress(null);
+        long id = box.put(entity);
+
+        TestEntity read = box.get(id);
+        assertNotNull(read);
+        assertEquals("no-address", read.getSimpleString());
+        assertNull(read.getAddress());
+    }
+
+    @Test
+    public void testQueryByEmbeddedField() {
+        TestEntity e1 = new TestEntity();
+        e1.setSimpleString("Office A");
+        e1.setAddress(new Address("St 1", "Berlin", 10115));
+        box.put(e1);
+
+        TestEntity e2 = new TestEntity();
+        e2.setSimpleString("Office B");
+        e2.setAddress(new Address("St 2", "Munich", 80331));
+        box.put(e2);
+
+        TestEntity e3 = new TestEntity();
+        e3.setSimpleString("Office C");
+        e3.setAddress(new Address("St 3", "Berlin", 10117));
+        box.put(e3);
+
+        // Query by embedded city
+        try (Query<TestEntity> query = box.query(
+                TestEntity_.address_city.equal("Berlin")
+        ).build()) {
+            List<TestEntity> results = query.find();
+            assertEquals(2, results.size());
+            assertEquals("Office A", results.get(0).getSimpleString());
+            assertEquals("Office C", results.get(1).getSimpleString());
+        }
+
+        // Query by embedded zip
+        try (Query<TestEntity> query = box.query(
+                TestEntity_.address_zip.equal(80331)
+        ).build()) {
+            List<TestEntity> results = query.find();
+            assertEquals(1, results.size());
+            assertEquals("Office B", results.get(0).getSimpleString());
+        }
     }
 
 }
