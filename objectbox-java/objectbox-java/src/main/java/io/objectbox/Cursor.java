@@ -218,20 +218,54 @@ public abstract class Cursor<T> implements Closeable {
     }
 
     public T get(long key) {
-        return (T) nativeGetEntity(cursor, key);
+        T entity = (T) nativeGetEntity(cursor, key);
+        attachEmbedded(entity);
+        return entity;
     }
 
     public T next() {
-        return (T) nativeNextEntity(cursor);
+        T entity = (T) nativeNextEntity(cursor);
+        attachEmbedded(entity);
+        return entity;
     }
 
     public T first() {
-        return (T) nativeFirstEntity(cursor);
+        T entity = (T) nativeFirstEntity(cursor);
+        attachEmbedded(entity);
+        return entity;
     }
 
     /** ~10% slower than iterating with {@link #first()} and {@link #next()} as done by {@link Box#getAll()}. */
     public List<T> getAll() {
-        return nativeGetAllEntities(cursor);
+        List<T> entities = nativeGetAllEntities(cursor);
+        attachEmbedded(entities);
+        return entities;
+    }
+
+    /**
+     * Post-read hook invoked after the native layer has populated an entity. The default
+     * implementation is a no-op. Generated {@code Cursor} subclasses for entities containing
+     * {@link io.objectbox.annotation.Embedded @Embedded} fields override this to hydrate the
+     * embedded container objects from the flat synthetic fields the native layer wrote.
+     * <p>
+     * May be called with {@code null} (e.g. {@link #get(long)} on a missing key).
+     */
+    @Internal
+    public void attachEmbedded(@Nullable T entity) {
+        // No embedded fields by default — generated Cursor subclasses override when needed.
+    }
+
+    /**
+     * List overload of {@link #attachEmbedded(Object)}. Iterates and delegates per element.
+     * May be called with {@code null}.
+     */
+    @Internal
+    public final void attachEmbedded(@Nullable List<T> entities) {
+        if (entities != null) {
+            for (T entity : entities) {
+                attachEmbedded(entity);
+            }
+        }
     }
 
     public boolean deleteEntity(long key) {
@@ -315,7 +349,9 @@ public abstract class Cursor<T> implements Closeable {
     @Internal
     List<T> getBacklinkEntities(int entityId, Property<?> relationIdProperty, long key) {
         try {
-            return nativeGetBacklinkEntities(cursor, entityId, relationIdProperty.getId(), key);
+            List<T> entities = nativeGetBacklinkEntities(cursor, entityId, relationIdProperty.getId(), key);
+            attachEmbedded(entities);
+            return entities;
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("Please check if the given property belongs to a valid @Relation: "
                     + relationIdProperty, e);
@@ -334,7 +370,9 @@ public abstract class Cursor<T> implements Closeable {
 
     @Internal
     public List<T> getRelationEntities(int sourceEntityId, int relationId, long key, boolean backlink) {
-        return nativeGetRelationEntities(cursor, sourceEntityId, relationId, key, backlink);
+        List<T> entities = nativeGetRelationEntities(cursor, sourceEntityId, relationId, key, backlink);
+        attachEmbedded(entities);
+        return entities;
     }
 
     @Internal

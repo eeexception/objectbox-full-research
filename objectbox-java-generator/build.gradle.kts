@@ -44,7 +44,8 @@ buildscript {
     }
 
     val objectboxPluginVersion by extra(versionNumber + versionPostFix) // Artifact versions of this project.
-    val objectboxJavaVersion by extra(libsVersion) // Java library used by sub-projects.
+    // @Embedded feature dev: depend on locally-published 5.2.0-a artifacts (isolated from default 5.2.0 mavenLocal).
+    val objectboxJavaVersion by extra("5.2.0-a") // Java library used by sub-projects.
     val appliesObxJavaVersion by extra(libsVersion) // Java library added to projects applying the plugin.
     val appliesObxJniLibVersion by extra(libsVersion) // Native library added to projects applying the ObjectBoxGradlePlugin.
     val appliesObxSyncJniLibVersion by extra(libsSyncVersion) // Native library added to projects applying the ObjectBoxSyncGradlePlugin.

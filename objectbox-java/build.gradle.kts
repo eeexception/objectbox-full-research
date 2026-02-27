@@ -20,7 +20,11 @@ plugins {
 buildscript {
     // Version of Maven artifacts
     // Should only be changed as part of the release process, see the release checklist in the objectbox repo
-    val versionNumber = "5.2.0"
+    // Note: suffixed "-a" for isolated local publishing during @Embedded feature development
+    // to avoid polluting the default 5.2.0 mavenLocal entry used by parallel tasks.
+    val versionNumber = "5.2.0-a"
+    // Native lib version must stay on the real Maven Central coordinate — there is no 5.2.0-a native build.
+    val nativeVersionNumber = "5.2.0"
 
     // Release mode should only be enabled when manually triggering a CI pipeline,
     // see the release checklist in the objectbox repo.
@@ -36,7 +40,7 @@ buildscript {
 
     // Native library version for tests
     // Be careful to diverge here; easy to forget and hard to find JNI problems
-    val nativeVersion = versionNumber + (if (isRelease) "" else "-dev-SNAPSHOT")
+    val nativeVersion = nativeVersionNumber + (if (isRelease) "" else "-dev-SNAPSHOT")
     val osName = System.getProperty("os.name").lowercase()
     val objectboxPlatform = when {
         osName.contains("linux") -> "linux"

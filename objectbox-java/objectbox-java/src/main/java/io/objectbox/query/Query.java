@@ -29,6 +29,7 @@ import javax.annotation.Nullable;
 
 import io.objectbox.Box;
 import io.objectbox.BoxStore;
+import io.objectbox.Cursor;
 import io.objectbox.InternalAccess;
 import io.objectbox.Property;
 import io.objectbox.annotation.Entity;
@@ -206,6 +207,15 @@ public class Query<T> implements Closeable {
     }
 
     /**
+     * To be called inside a read TX. Returns the active {@link Cursor} (generated subclass) so the
+     * query can invoke {@link Cursor#attachEmbedded} on entities returned by native find — these
+     * bypass the Java read methods on {@link Cursor} and therefore need explicit hydration.
+     */
+    Cursor<T> cursor() {
+        return InternalAccess.getActiveTxCursor(box);
+    }
+
+    /**
      * Finds the first object matching this query.
      * <p>
      * Note: if no {@link QueryBuilder#order} conditions are present, which object is the first one might be arbitrary
@@ -219,6 +229,7 @@ public class Query<T> implements Closeable {
         return callInReadTx(() -> {
             @SuppressWarnings("unchecked")
             T entity = (T) nativeFindFirst(handle, cursorHandle());
+            cursor().attachEmbedded(entity);
             resolveEagerRelation(entity);
             return entity;
         });
@@ -255,6 +266,7 @@ public class Query<T> implements Closeable {
         return callInReadTx(() -> {
             @SuppressWarnings("unchecked")
             T entity = (T) nativeFindUnique(handle, cursorHandle());
+            cursor().attachEmbedded(entity);
             resolveEagerRelation(entity);
             return entity;
         });
@@ -272,6 +284,8 @@ public class Query<T> implements Closeable {
     public List<T> find() {
         return callInReadTx(() -> {
             List<T> entities = nativeFind(Query.this.handle, cursorHandle(), 0, 0);
+            // Hydrate embedded containers before any user-visible filter/comparator sees the entity.
+            cursor().attachEmbedded(entities);
             if (filter != null) {
                 Iterator<T> iterator = entities.iterator();
                 while (iterator.hasNext()) {
@@ -302,6 +316,7 @@ public class Query<T> implements Closeable {
         ensureNoFilterNoComparator();
         return callInReadTx(() -> {
             List<T> entities = nativeFind(handle, cursorHandle(), offset, limit);
+            cursor().attachEmbedded(entities);
             resolveEagerRelations(entities);
             return entities;
         });
@@ -430,9 +445,12 @@ public class Query<T> implements Closeable {
         ensureNoFilterNoComparator();
         return callInReadTx(() -> {
             List<ObjectWithScore<T>> results = nativeFindWithScores(handle, cursorHandle(), offset, limit);
-            if (eagerRelations != null) {
-                for (int i = 0; i < results.size(); i++) {
-                    resolveEagerRelationForNonNullEagerRelations(results.get(i).get(), i);
+            Cursor<T> cursor = cursor();
+            for (int i = 0; i < results.size(); i++) {
+                T entity = results.get(i).get();
+                cursor.attachEmbedded(entity);
+                if (eagerRelations != null) {
+                    resolveEagerRelationForNonNullEagerRelations(entity, i);
                 }
             }
             return results;

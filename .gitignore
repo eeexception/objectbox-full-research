@@ -1,1 +1,112 @@
 .claude
+
+# Binary libs
+objectbox-generator/*.a
+objectbox-generator/*.so
+objectbox-generator/*.dylib
+objectbox-generator/*.dll
+
+# IDE (e.g. CLion)
+objectbox-generator/.idea/
+objectbox-generator/objectbox-generator/.vscode/
+
+scripts/tmp*
+
+# Command built using `make build`
+/objectbox-generator
+objectbox-generator//objectbox-generator.exe
+objectbox-generator/build/
+
+# CMake/C++ Examples:
+objectbox-generator/examples/*/_deps
+objectbox-generator/examples/*/build
+objectbox-generator/examples/**/*.obx.cpp
+objectbox-generator/examples/**/*.obx.hpp
+objectbox-generator/examples/**/objectbox-model.h
+objectbox-generator/examples/**/objectbox-model.json
+
+###
+
+objectbox-java/.DS_Store
+
+# IntelliJ Idea
+objectbox-java/.idea/
+objectbox-java/*.iml
+
+# Gradle & Java build
+objectbox-java/.gradle
+objectbox-java/build/
+objectbox-java/bin/
+objectbox-java/gen/
+objectbox-java/target/
+objectbox-java/out/
+objectbox-java/classes/
+
+# Kotlin
+objectbox-java/.kotlin
+
+# Local build properties
+objectbox-java/build.properties
+objectbox-java/local.properties
+
+# Native libs
+objectbox-java/*.dll
+objectbox-java/libobjectbox*.so
+objectbox-java/libobjectbox*.dylib
+
+### Test DB files
+objectbox-java/data.mdb
+objectbox-java/lock.mdb
+objectbox-java/test-db/
+objectbox-java/jni-unit-test-db/
+objectbox-java/test-db64/
+objectbox-java/perf-test-db/
+objectbox-java/perf-test-db64/
+
+## Backups
+objectbox-java/.gitignore~
+objectbox-java/*.txt~
+objectbox-java/default.json.bak
+
+# Java crash reports
+objectbox-java/hs_err_pid*.log
+
+###
+
+objectbox-java-generator/.gradle
+objectbox-java-generator/build/
+objectbox-java-generator/out/
+
+# Ignore Gradle GUI config
+objectbox-java-generator/gradle-app.setting
+
+# Avoid ignoring Gradle wrapper jar file (.jar files are usually ignored)
+!objectbox-java-generator/gradle-wrapper.jar
+
+# Kotlin
+objectbox-java-generator/.kotlin
+
+# IntelliJ IDEA
+objectbox-java-generator/.idea/
+objectbox-java-generator/*.iml
+
+# objectbox-models/
+objectbox-java-generator/*.json.bak
+
+objectbox-java-generator/objectbox-processor/bin/
+objectbox-java-generator/agp-wrapper-7-2/bin
+objectbox-java-generator/objectbox-code-modifier/bin/
+objectbox-java-generator/objectbox-generator/bin/
+objectbox-java-generator/objectbox-gradle-plugin/bin/
+objectbox-java-generator/buildSrc
+objectbox-java-generator/objectbox-code-modifier/build
+objectbox-java-generator/objectbox-generator/build
+objectbox-java-generator/objectbox-processor/build
+objectbox-java-generator/agp-wrapper-7-2/build
+objectbox-java-generator/objectbox-gradle-plugin/build
+objectbox-java-generator/objectbox-generator/build
+objectbox-java-generator/objectbox-code-modifier/build
+objectbox-java-generator/objectbox-processor/build
+objectbox-java-generator/agp-wrapper-7-2/build
+objectbox-java-generator/objectbox-gradle-plugin/build
+objectbox-java-generator/buildSrc/build
