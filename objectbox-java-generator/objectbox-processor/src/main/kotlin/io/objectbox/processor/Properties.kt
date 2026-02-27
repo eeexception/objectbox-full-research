@@ -266,6 +266,24 @@ class Properties(
             }
 
             val innerTypeMirror = innerField.asType()
+
+            // ─── R5: Relations inside @Embedded — explicit rejection ───
+            // A ToOne/ToMany inside a value object would require injecting __boxStore into a
+            // non-@Entity class AND synthesising the relation's FK column through two layers
+            // of flattening. The pattern the user almost certainly wants — a relation from the
+            // OWNING entity — already works. Intercept BEFORE getPropertyType() (which would
+            // just return null and fall through to the generic "unsupported type" below with no
+            // hint that the fix is trivial: move the relation one level up).
+            if (typeHelper.isToOne(innerTypeMirror) || typeHelper.isToMany(innerTypeMirror)) {
+                messages.error(
+                    "@Embedded '$fieldName': relations are not supported inside an @Embedded type " +
+                            "(inner field '$innerFieldName' is a ${innerTypeMirror}). " +
+                            "Move the relation to the owning entity instead.",
+                    innerField
+                )
+                return
+            }
+
             val innerPropertyType = typeHelper.getPropertyType(innerTypeMirror)
             if (innerPropertyType == null) {
                 // Only directly-supported types inside embedded containers — no @Convert on

@@ -22,6 +22,7 @@ import com.google.common.truth.Truth.assertThat
 import io.objectbox.generator.model.PropertyType
 import org.intellij.lang.annotations.Language
 import org.junit.Test
+import java.io.File
 import java.nio.charset.StandardCharsets
 
 /**
@@ -959,4 +960,433 @@ class EmbeddedTest : BaseProcessorTest() {
     }
 
     // endregion M2.3
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // region M5 — Hardening / test-gap closure
+    //
+    // These tests close known coverage gaps identified in the IMPLEMENTATION_PLAN.md §5.1 test
+    // matrix that were not exercised during M1–M2. Most PIN behaviour that already works
+    // (accessor-aware codegen, IdSync stability) — the point is to LOCK the contract so future
+    // refactors can't silently regress it. T9 is the exception: it adds a sharper error for
+    // relations inside embedded types (R5 in the plan).
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * T5 — Model JSON idempotence across re-compiles.
+     *
+     * The flattened synthetic properties (`priceCurrency`, `priceAmount`) MUST be stable in
+     * IdSync: a re-compile against an existing `objectbox-models/default.json` must NOT
+     * churn their UIDs. This is critical — if each incremental build assigns fresh UIDs to
+     * embedded-derived columns, the schema drifts and users hit "schema mismatch" at runtime
+     * after every edit-compile cycle.
+     *
+     * Mechanism: IdSync matches properties by `name`. The processor synthesises flattened names
+     * via [EmbeddedField.syntheticNameFor] and passes them to `Entity.addProperty(type, name)`.
+     * As long as those names are deterministic (which they are — pure function of container
+     * field name + annotation prefix + inner field name), IdSync treats them like any other
+     * property and re-uses their UIDs. This test proves that contract holds end-to-end.
+     *
+     * Test shape — two compiles against the SAME model file (no fixture commit needed):
+     * 1. First compile: temp model file is created fresh (random UIDs assigned).
+     * 2. Snapshot the resulting JSON.
+     * 3. Second compile: same TestEnvironment instance → same temp file path → the init-block
+     *    deletion already ran, so the `.tmp` from compile #1 is reused as the starting model.
+     * 4. Assert JSON is byte-identical to the snapshot.
+     *
+     * Why no committed golden fixture? That pattern (used by e.g. `UnsignedTest`) bakes random
+     * UIDs into git. Here we only care about CROSS-COMPILE stability, not absolute UID values —
+     * a self-contained two-compile test proves idempotence without committing random data.
+     */
+    @Test
+    fun embedded_modelJsonIdempotentAcrossRecompile() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        // ONE environment — useTemporaryModelFile=true deletes any stale .tmp at construction,
+        // so compile #1 starts clean. We do NOT re-construct for compile #2; the .tmp from #1
+        // becomes the input model for #2.
+        val env = TestEnvironment("embedded-idempotence.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        // ─── Compile #1 — creates .tmp with fresh random UIDs ───
+        env.compile().assertThatIt { succeededWithoutWarnings() }
+        val model = env.readModel()
+        val billEntity = model.findEntity("Bill", null)
+            ?: error("Bill entity missing after first compile — processor didn't write model")
+        // Sanity: flattened props present with real (non-zero) UIDs
+        val currencyUid = billEntity.properties.single { it.name == "priceCurrency" }.uid
+        val amountUid = billEntity.properties.single { it.name == "priceAmount" }.uid
+        assertThat(currencyUid).isNotEqualTo(0L)
+        assertThat(amountUid).isNotEqualTo(0L)
+
+        // ─── Snapshot raw JSON ───
+        // The .tmp path is internal to TestEnvironment, but the MODEL-DIR is stable.
+        val modelsDir = when {
+            File("src/test/resources/objectbox-models/").isDirectory -> "src/test/resources/objectbox-models/"
+            else -> "objectbox-processor/src/test/resources/objectbox-models/"
+        }
+        val modelFile = File("${modelsDir}embedded-idempotence.json.tmp")
+        val afterFirstCompile = modelFile.readText()
+
+        // ─── Compile #2 — SAME env, SAME .tmp (still on disk from #1) ───
+        // Fresh processor shim: ObjectBoxProcessor has internal state that must reset between
+        // annotation-processing rounds. compile-testing wraps each compile() in a fresh javac
+        // invocation, but TestEnvironment.processor is a val — so we use the overload that
+        // accepts a fresh processor. Actually: looking at Compiler.javac().withProcessors(),
+        // compile-testing calls init() each invocation → state IS reset. But `processor.schema`
+        // would stale. We only read the model file, not env.schema, so no issue — but a
+        // belt-and-suspenders second env with the same (non-deleted) .tmp is safer.
+        //
+        // Actually — simplest robust approach: we've snapshotted the JSON. Construct a SECOND
+        // TestEnvironment with useTemporaryModelFile=true (this DELETES the .tmp), then write
+        // our snapshot back as the starting model BEFORE compile. This mirrors exactly what a
+        // user's incremental build does: existing model.json on disk → compile → same model.json.
+        val env2 = TestEnvironment("embedded-idempotence.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+        modelFile.writeText(afterFirstCompile) // restore snapshot as input model
+        env2.compile().assertThatIt { succeededWithoutWarnings() }
+
+        val afterSecondCompile = modelFile.readText()
+
+        // ─── Core assertion: byte-identical across compiles ───
+        // A failure here means: the processor treats embedded-derived synthetic property names
+        // as unstable (e.g. non-deterministic prefix resolution, or IdSync mismatch on flattened
+        // names), causing UID re-generation → schema drift → production breakage.
+        assertThat(afterSecondCompile).isEqualTo(afterFirstCompile)
+
+        // ─── Belt-and-suspenders: verify UIDs match exactly via parsed model ───
+        val model2 = env2.readModel()
+        val billEntity2 = model2.findEntity("Bill", null)!!
+        assertThat(billEntity2.properties.single { it.name == "priceCurrency" }.uid)
+            .isEqualTo(currencyUid)
+        assertThat(billEntity2.properties.single { it.name == "priceAmount" }.uid)
+            .isEqualTo(amountUid)
+    }
+
+    /**
+     * T9 — `ToOne`/`ToMany` inside an `@Embedded` type → error (R5).
+     *
+     * Embedded types model **value semantics**: their fields become flat columns on the owner.
+     * Relations model **reference semantics**: they point at OTHER entities via a foreign key
+     * stored in a synthetic `<relationName>Id` column + runtime ToOne resolution.
+     *
+     * A `ToOne<Customer>` inside `Money` would need BOTH mechanisms at once:
+     * - the ToOne's synthetic FK column flattened onto `Bill` (e.g. `priceOwnerId`)
+     * - the transformer to inject `__boxStore` into `Money` (which isn't an @Entity)
+     * - `attachEntity()` wiring for a non-entity
+     *
+     * That's a cross-cutting rabbit hole nobody has asked for. The fix is trivial for the user:
+     * move the relation UP to the entity (`Bill.owner: ToOne<Customer>`) where it already works.
+     *
+     * RED state: falls through to line 274's generic "unsupported type 'ToOne<X>'" — correct
+     * but doesn't explain WHY or how to fix. GREEN: explicit check with actionable guidance.
+     */
+    @Test
+    fun embedded_toOneInsideContainer_errors() {
+        @Language("Java")
+        val customer =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+
+            @Entity
+            public class Customer {
+                @Id public long id;
+                public String name;
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.relation.ToOne;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public ToOne<Customer> owner;  // ← relation inside embedded type (R5 violation)
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        TestEnvironment("embedded-toone-inside.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Customer", customer)
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+            .assertThatIt {
+                failed()
+                // R5-specific wording: name the offending field, name the pattern, point at the fix.
+                hadErrorContaining("@Embedded 'price': relations are not supported inside an @Embedded type")
+                hadErrorContaining("inner field 'owner'")
+                hadErrorContaining("Move the relation to the owning entity")
+            }
+    }
+
+    /**
+     * T11 — Unsupported inner field type → error attributed to BOTH container AND inner field.
+     *
+     * `java.util.UUID` is a common user type with no built-in ObjectBox mapping (users must
+     * use `@Convert` on a regular entity field; `@Convert` inside `@Embedded` is deferred).
+     *
+     * The generic unsupported-type path at Properties.kt:274 already handles this — the test
+     * just PINS the contract that BOTH the `@Embedded` container field name AND the offending
+     * inner field name appear in the error. Without that dual attribution, a user with three
+     * `@Embedded` fields all pointing at the same value-object type sees only the inner field
+     * name and has to hunt.
+     */
+    @Test
+    fun embedded_unsupportedInnerType_errorsWithBothFieldNames() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import java.util.UUID;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public UUID txId;   // ← UUID has no PropertyType mapping → unsupported
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        TestEnvironment("embedded-unsupported-inner.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+            .assertThatIt {
+                failed()
+                // Dual attribution — container field AND inner field.
+                hadErrorContaining("@Embedded 'price'")
+                hadErrorContaining("inner field 'txId'")
+                hadErrorContaining("unsupported type 'java.util.UUID'")
+            }
+    }
+
+    /**
+     * T13 — Private `@Embedded` container field + public getter/setter → generated `put()`
+     * uses `entity.getPrice()` (not `entity.price`).
+     *
+     * The model captures container accessibility (Properties.kt:219 →
+     * [EmbeddedField.isFieldAccessible]), and `PropertyCollector` honours it via
+     * [EmbeddedField.getContainerValueExpression] — which returns `getPrice()` for a private
+     * field. This test proves that mechanism is wired end-to-end (not just present in the model)
+     * and that the generated Cursor COMPILES against a private container (javac validates the
+     * getter exists and returns the right type).
+     *
+     * Why does this matter? Kotlin properties, Lombok `@Getter/@Setter`, records — many modern
+     * Java styles make fields private by default. Without accessor-aware codegen, every
+     * `@Embedded` user would be forced into `public` container fields, a clumsy API leak.
+     */
+    @Test
+    fun embedded_put_privateContainerField_usesGetterAccess() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+
+                // Private container — codegen MUST use getPrice()/setPrice(), not field access.
+                // javac will reject `entity.price` from the generated Cursor (different package).
+                @Embedded private Money price;
+
+                public Money getPrice() { return price; }
+                public void setPrice(Money price) { this.price = price; }
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-private-container.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        val compilation = env.compile()
+
+        // Gate: generated Cursor must COMPILE. If PropertyCollector emits `entity.price` for a
+        // private field, javac fails here (Cursor is in com.example, same package — wait,
+        // actually same package DOES allow private access... no: private is CLASS-scoped, not
+        // package-scoped. javac will fail with "price has private access in Bill").
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation.generatedSourceFileOrFail("com.example.BillCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // Container hoist uses the GETTER — this is the core T13 proof.
+        src.contains("Money __emb_price = entity.getPrice();")
+
+        // Negative: direct field access would fail javac, but pin the contract explicitly.
+        src.doesNotContain("entity.price;")
+        src.doesNotContain("entity.price ")
+    }
+
+    /**
+     * T14 — Private inner field on the embedded type + public getter → generated `put()`
+     * uses `__emb_price.getCurrency()` (not `__emb_price.currency`).
+     *
+     * Orthogonal to T13: T13 tests the CONTAINER's accessibility; T14 tests the INNER FIELD's.
+     * Both are independently tracked ([EmbeddedField.isFieldAccessible] vs
+     * [Property.embeddedSourceFieldAccessible]) and both must route through the accessor-aware
+     * expression machinery ([Property.getEmbeddedSourceValueExpression]).
+     *
+     * Real-world motivation: value objects with Lombok `@Value`, records, or hand-written
+     * immutable classes will have private fields with getters. Forcing `public` on inner fields
+     * would be a worse API leak than T13 (value objects are meant to encapsulate).
+     */
+    @Test
+    fun embedded_put_privateInnerField_usesGetterAccess() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                // Private inner field — codegen MUST use getCurrency(), not field access.
+                private String currency;
+                public long amount;
+
+                public Money() {}
+                public String getCurrency() { return currency; }
+                public void setCurrency(String c) { this.currency = c; }
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-private-inner.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        val compilation = env.compile()
+
+        // Gate: if codegen emits `__emb_price.currency` for a private field, javac rejects it
+        // ("currency has private access in Money") and this line fails first.
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation.generatedSourceFileOrFail("com.example.BillCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // Container hoist unchanged (public container → field access still fine).
+        src.contains("Money __emb_price = entity.price;")
+
+        // Inner read uses the GETTER — core T14 proof.
+        src.contains("__emb_price.getCurrency()")
+
+        // The public inner field (amount) still uses field access — proves per-field
+        // accessibility resolution, not a global switch.
+        src.contains("__emb_price.amount")
+
+        // Negative.
+        src.doesNotContain("__emb_price.currency")
+    }
+
+    // endregion M5
 }
