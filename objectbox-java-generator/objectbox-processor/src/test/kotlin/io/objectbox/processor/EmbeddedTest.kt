@@ -823,20 +823,23 @@ class EmbeddedTest : BaseProcessorTest() {
      * `priceCurrency`/`priceAmount` being set on the (post-transformer) flat fields.
      *
      * GREEN: the generated Cursor emits an `@Override public void attachEmbedded(Bill entity)`
-     * stub with:
-     *  - A null-guard (the base method is called with `@Nullable T` — get()/first() return null
-     *    when the key doesn't exist, and native may yield null during iteration end).
-     *  - NO actual hydration code — the body references ONLY things that exist at APT time
-     *    (i.e. nothing: the stub body is the null-guard and a comment).
-     *  - A descriptive comment showing M3 what to inject, mirroring `attachEntity()`.
+     * stub with an EMPTY body (compiles to a single RETURN opcode — exactly like `attachEntity()`,
+     * so the transformer's is-stub check is uniform). The transformer injects:
+     *  - the null-guard (base hook is called with `@Nullable T` from get()/first()/next()),
+     *  - the synthetic transient flat-fields onto the entity class,
+     *  - the hydration body that copies those flat fields into freshly-instantiated containers.
+     *
+     * The stub is purely a MARKER: its PRESENCE tells the transformer "this cursor's entity has
+     * @Embedded"; its body is owned by the transformer. Keeping the null-guard in transformer
+     * code (not in the APT stub) means the stub contract is "1-byte RETURN" identical to
+     * `attachEntity()` — no special-case empty-body detection in the transformer.
      *
      * Critically, the stub must NOT reference `entity.priceCurrency` or `new Money()` — those
      * would fail the `succeededWithoutWarnings()` gate because the synthetic flat fields don't
-     * exist yet. The gate IS the real proof here; the `doesNotContain()` fragment-asserts are
-     * belt-and-suspenders documentation of the contract.
+     * exist yet. The gate IS the real proof; the `doesNotContain()` asserts are belt-and-suspenders.
      */
     @Test
-    fun embedded_attachEmbedded_generatesEmptyStubWithNullGuard() {
+    fun embedded_attachEmbedded_generatesEmptyStubMarker() {
         @Language("Java")
         val money =
             """
@@ -885,11 +888,12 @@ class EmbeddedTest : BaseProcessorTest() {
         // with reduced visibility is a compile error). Concrete type substituted for T.
         src.contains("public void attachEmbedded(Bill entity)")
 
-        // ─── 2. Null-guard present ───
-        // The base method is invoked with `@Nullable T` from get()/first()/next(), and the
-        // list overload iterates without filtering nulls. A null-dereference in hydration
-        // would NPE on every not-found get() call.
-        src.contains("if (entity == null) return;")
+        // ─── 2. Body is EMPTY — no null-guard at APT time ───
+        // The stub must compile to a single RETURN opcode so the transformer's is-stub check
+        // (same check as attachEntity()) passes uniformly. The transformer injects the null-
+        // guard as the first statement of the hydration body it injects. If a null-guard were
+        // here, the transformer would see a multi-opcode body and warn about "unexpected code".
+        src.doesNotContain("if (entity == null)")
 
         // ─── 3. Descriptive comment for M3 transformer ───
         // Mirrors the attachEntity() stub pattern: a human-readable hint showing WHAT the

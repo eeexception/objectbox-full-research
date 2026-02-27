@@ -20,6 +20,7 @@ package io.objectbox.gradle.transform
 
 import io.objectbox.annotation.BaseEntity
 import io.objectbox.annotation.Convert
+import io.objectbox.annotation.Embedded
 import io.objectbox.annotation.Entity
 import io.objectbox.annotation.Transient
 
@@ -51,6 +52,16 @@ object ClassConst {
     const val cursorClass = "io.objectbox.Cursor"
     const val cursorAttachEntityMethodName = "attachEntity"
     const val cursorBoxStoreFieldName = "boxStoreForEntities"
+
+    // ── @Embedded (component mapping) ───────────────────────────────────────────────────
+    // Detected by annotation presence on a FIELD, not by container type (unlike ToOne/ToMany
+    // above whose descriptors are fixed). CLASS-retained — resolved via FieldInfo.exGetAnnotation
+    // which checks both visibleTag and invisibleTag.
+    val embeddedAnnotationName = Embedded::class.qualifiedName!!
+    /** Sentinel `"\0"` meaning "derive prefix from field name" — must match Embedded.USE_FIELD_NAME. */
+    const val embeddedPrefixUseFieldName = Embedded.USE_FIELD_NAME
+    /** Name of the M0 read-path hydration hook generated cursors override (empty stub at APT time). */
+    const val cursorAttachEmbeddedMethodName = "attachEmbedded"
 
     const val listDescriptor = "Ljava/util/List;"
 

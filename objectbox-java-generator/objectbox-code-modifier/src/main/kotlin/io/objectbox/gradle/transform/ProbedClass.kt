@@ -51,6 +51,24 @@ data class ProbedClass(
     val hasToOneRef: Boolean = false,
     val hasToManyRef: Boolean = false,
     val hasBoxStoreField: Boolean = false,
+    /**
+     * True if this entity (or base entity) has at least one `@Embedded`-annotated field.
+     *
+     * Unlike [hasToOneRef]/[hasToManyRef] which are inferred from the field's *descriptor*
+     * (the container type `ToOne`/`ToMany` IS the signal), embedded containers are arbitrary
+     * POJOs — the only signal is the annotation on the field. The prober therefore scans
+     * `FieldInfo` annotations directly; the annotation is `@Retention(CLASS)` so it survives
+     * into bytecode (readable via the `invisibleTag` attribute table).
+     *
+     * Drives two transforms when true:
+     *  1. **Entity** — inject synthetic `transient` flat-fields (names match the flattened
+     *     property names APT emitted into `Entity_`), so JNI can set them on reads.
+     *  2. **Cursor** — inject the `attachEmbedded()` body (null-guard + container instantiation
+     *     + copy synthetic-flat → container.inner).
+     *
+     * Strictly orthogonal to [hasRelation] — an embedded container is not a relation.
+     */
+    val hasEmbeddedRef: Boolean = false,
     val interfaces: List<String> = listOf()
 ) {
     fun hasRelation(entityTypes: Set<String>): Boolean =

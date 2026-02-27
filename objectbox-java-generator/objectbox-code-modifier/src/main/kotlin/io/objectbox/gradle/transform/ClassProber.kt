@@ -74,6 +74,10 @@ class ClassProber {
                         hasBoxStoreField = fields.any { it.name == ClassConst.boxStoreFieldName },
                         hasToOneRef = hasClassRef(classFile, ClassConst.toOne, ClassConst.toOneDescriptor),
                         hasToManyRef = hasClassRef(classFile, ClassConst.toMany, ClassConst.toManyDescriptor),
+                        // Direct annotation scan — no descriptor shortcut available for @Embedded (container
+                        // type is an arbitrary user POJO). exGetAnnotation checks both RUNTIME- and CLASS-
+                        // retained attribute tables, so @Embedded's @Retention(CLASS) is resolvable here.
+                        hasEmbeddedRef = fields.any { it.exGetAnnotation(ClassConst.embeddedAnnotationName) != null },
                         interfaces = if (isEntity) classFile.interfaces.toList() else listOf()
                     )
                 }

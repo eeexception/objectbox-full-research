@@ -105,6 +105,41 @@ class ClassProberTest : AbstractTransformTest() {
         assertTrue(probed.isCursor)
     }
 
+    // ── @Embedded probe ────────────────────────────────────────────────────────────────────
+    // Unlike ToOne/ToMany (detected by field *descriptor* — the container type IS the
+    // signal), @Embedded has no type-level marker: the container is an arbitrary POJO. The
+    // only signal is the annotation itself, so the prober must scan FieldInfo annotations
+    // (CLASS-retained → lives in the invisibleTag attribute, same path as @Transient).
+
+    /** Default-prefix case: @Embedded with no explicit prefix → USE_FIELD_NAME sentinel. */
+    @Test
+    fun testProbeEntityEmbedded() {
+        val entity = probeClass(EntityEmbedded::class)
+        assertTrue("entity with @Embedded field should flag hasEmbeddedRef", entity.hasEmbeddedRef)
+        // Orthogonality: @Embedded does NOT imply relations, must not cross-contaminate flags.
+        assertFalse(entity.hasToOneRef)
+        assertFalse(entity.hasToManyRef)
+    }
+
+    /**
+     * Explicit-empty-prefix case: @Embedded(prefix = "") — the prober doesn't care about the
+     * prefix VALUE (that's M3.3's concern), only about the annotation's PRESENCE. This test
+     * guards against accidentally filtering on a truthy prefix attribute.
+     */
+    @Test
+    fun testProbeEntityEmbeddedNoPrefix() {
+        val entity = probeClass(EntityEmbeddedNoPrefix::class)
+        assertTrue(entity.hasEmbeddedRef)
+    }
+
+    /** Negative baseline — entity with zero @Embedded fields must NOT set the flag. */
+    @Test
+    fun testProbeEntityNoEmbedded() {
+        assertFalse(probeClass(EntityEmpty::class).hasEmbeddedRef)
+        // Also check a relation-bearing entity doesn't accidentally trip the embedded flag.
+        assertFalse(probeClass(EntityToOne::class).hasEmbeddedRef)
+    }
+
     @Test
     fun testProbeEntityInfo() {
         val probed = probeClass(EntityToOneLateInit_::class)
