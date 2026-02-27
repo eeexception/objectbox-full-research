@@ -76,10 +76,22 @@ class PropertyCollector {
         Set<String> extractedEmbedded = new LinkedHashSet<>();
         for (Property property : entity.getProperties()) {
             if (property.isEmbedded() && extractedEmbedded.add(property.getEmbeddedFieldName())) {
-                all.append(INDENT)
-                        .append(property.getEmbeddedFieldType()).append(' ')
-                        .append(property.getEmbeddedFieldName()).append(" = entity.")
-                        .append(property.getEmbeddedFieldGetter()).append(";\n");
+                String parentField = property.getEmbeddedParentFieldName();
+                if (parentField == null) {
+                    // Top-level embedded: extract from entity
+                    all.append(INDENT)
+                            .append(property.getEmbeddedFieldType()).append(' ')
+                            .append(property.getEmbeddedFieldName()).append(" = entity.")
+                            .append(property.getEmbeddedFieldGetter()).append(";\n");
+                } else {
+                    // Nested embedded: extract from parent with null guard
+                    all.append(INDENT)
+                            .append(property.getEmbeddedFieldType()).append(' ')
+                            .append(property.getEmbeddedFieldName()).append(" = ")
+                            .append(parentField).append(" != null ? ")
+                            .append(parentField).append('.')
+                            .append(property.getEmbeddedFieldGetter()).append(" : null;\n");
+                }
             }
         }
         if (!extractedEmbedded.isEmpty()) {

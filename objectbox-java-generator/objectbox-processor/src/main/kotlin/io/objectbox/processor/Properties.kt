@@ -175,25 +175,6 @@ class Properties(
             return
         }
 
-        // Validate: embedded class must not have @Entity annotation (check by annotation name to avoid import conflict)
-        val hasEntityAnnotation = embeddedTypeElement.annotationMirrors.any {
-            it.annotationType.toString() == "io.objectbox.annotation.Entity"
-        }
-        if (hasEntityAnnotation) {
-            messages.error(
-                "@Embedded class '${embeddedTypeElement.simpleName}' must not be an @Entity.", field
-            )
-            return
-        }
-        val embeddedFields = ElementFilter.fieldsIn(embeddedTypeElement.enclosedElements)
-        val hasIdField = embeddedFields.any { it.hasAnnotation(Id::class.java) }
-        if (hasIdField) {
-            messages.error(
-                "@Embedded class '${embeddedTypeElement.simpleName}' must not have an @Id property.", field
-            )
-            return
-        }
-
         // Determine prefix from @Embedded annotation mirror
         val embeddedMirror = field.annotationMirrors.find {
             it.annotationType.toString() == "io.objectbox.annotation.Embedded"
@@ -213,7 +194,6 @@ class Properties(
         val embeddedFieldGetter = if (isFieldAccessible) {
             embeddedFieldName
         } else {
-            // Look for a getter method
             val capName = embeddedFieldName.replaceFirstChar { it.titlecase(Locale.getDefault()) }
             val getter = methods.find { it.simpleName.toString() == "get$capName" }
             getter?.simpleName?.toString()?.let { "$it()" } ?: "get$capName()"
@@ -221,7 +201,54 @@ class Properties(
 
         val embeddedTypeName = embeddedTypeElement.simpleName.toString()
 
-        // Flatten each field of the embedded class
+        flattenEmbeddedFields(
+            field, embeddedTypeElement, prefix,
+            embeddedFieldName, embeddedFieldGetter, embeddedTypeName,
+            parentFieldName = null, depth = 0
+        )
+    }
+
+    /**
+     * Recursively flattens fields of an embedded class into the parent entity model.
+     * Supports nested @Embedded up to [MAX_EMBEDDED_DEPTH] levels deep.
+     */
+    private fun flattenEmbeddedFields(
+        errorElement: VariableElement,
+        embeddedTypeElement: TypeElement,
+        prefix: String,
+        embeddedFieldName: String,
+        embeddedFieldGetter: String,
+        embeddedTypeName: String,
+        parentFieldName: String?,
+        depth: Int
+    ) {
+        if (depth > MAX_EMBEDDED_DEPTH) {
+            messages.error(
+                "@Embedded nesting is too deep (max $MAX_EMBEDDED_DEPTH levels). Check for circular references.",
+                errorElement
+            )
+            return
+        }
+
+        // Validate: embedded class must not have @Entity annotation
+        val hasEntityAnnotation = embeddedTypeElement.annotationMirrors.any {
+            it.annotationType.toString() == "io.objectbox.annotation.Entity"
+        }
+        if (hasEntityAnnotation) {
+            messages.error(
+                "@Embedded class '${embeddedTypeElement.simpleName}' must not be an @Entity.", errorElement
+            )
+            return
+        }
+        val embeddedFields = ElementFilter.fieldsIn(embeddedTypeElement.enclosedElements)
+        val hasIdField = embeddedFields.any { it.hasAnnotation(Id::class.java) }
+        if (hasIdField) {
+            messages.error(
+                "@Embedded class '${embeddedTypeElement.simpleName}' must not have an @Id property.", errorElement
+            )
+            return
+        }
+
         for (embeddedField in embeddedFields) {
             val modifiers = embeddedField.modifiers
             if (modifiers.contains(Modifier.STATIC) || modifiers.contains(Modifier.TRANSIENT)
@@ -230,12 +257,59 @@ class Properties(
                 continue
             }
 
+            // Check if this sub-field is itself @Embedded
+            val hasEmbeddedAnnotation = embeddedField.annotationMirrors.any {
+                it.annotationType.toString() == "io.objectbox.annotation.Embedded"
+            }
+            if (hasEmbeddedAnnotation) {
+                val subType = embeddedField.asType()
+                val subDeclaredType = subType as? DeclaredType
+                val subTypeElement = subDeclaredType?.asElement() as? TypeElement
+                if (subTypeElement == null) {
+                    messages.error("@Embedded field must be a class type.", errorElement)
+                    return
+                }
+
+                // Determine sub-prefix
+                val subMirror = embeddedField.annotationMirrors.find {
+                    it.annotationType.toString() == "io.objectbox.annotation.Embedded"
+                }
+                val subPrefixValue = subMirror?.elementValues?.entries
+                    ?.find { it.key.simpleName.toString() == "prefix" }
+                    ?.value?.value?.toString()
+                val subPrefix = if (!subPrefixValue.isNullOrEmpty()) {
+                    prefix + subPrefixValue
+                } else {
+                    prefix + "${embeddedField.simpleName}_"
+                }
+
+                val subFieldName = prefix + embeddedField.simpleName.toString()
+                val isSubAccessible = !embeddedField.modifiers.contains(Modifier.PRIVATE)
+                val subFieldGetter = if (isSubAccessible) {
+                    embeddedField.simpleName.toString()
+                } else {
+                    val capName = embeddedField.simpleName.toString()
+                        .replaceFirstChar { it.titlecase(Locale.getDefault()) }
+                    val getter = ElementFilter.methodsIn(embeddedTypeElement.enclosedElements)
+                        .find { it.simpleName.toString() == "get$capName" }
+                    getter?.simpleName?.toString()?.let { "$it()" } ?: "get$capName()"
+                }
+                val subTypeName = subTypeElement.simpleName.toString()
+
+                flattenEmbeddedFields(
+                    errorElement, subTypeElement, subPrefix,
+                    subFieldName, subFieldGetter, subTypeName,
+                    parentFieldName = embeddedFieldName, depth = depth + 1
+                )
+                continue
+            }
+
             val embeddedFieldType = embeddedField.asType()
             val propertyType = typeHelper.getPropertyType(embeddedFieldType)
             if (propertyType == null) {
                 messages.error(
                     "Field type \"$embeddedFieldType\" in @Embedded class '${embeddedTypeName}' is not supported.",
-                    field
+                    errorElement
                 )
                 return
             }
@@ -244,7 +318,7 @@ class Properties(
             val propertyBuilder = try {
                 entityModel.addProperty(propertyType, flatPropertyName)
             } catch (e: Exception) {
-                messages.error("Could not add embedded property: ${e.message}", field)
+                messages.error("Could not add embedded property: ${e.message}", errorElement)
                 if (e is ModelException) return else throw e
             }
 
@@ -262,6 +336,9 @@ class Properties(
 
             // Set embedded metadata on the property
             propertyBuilder.embeddedField(embeddedFieldName, embeddedFieldGetter, embeddedPropertyGetter, embeddedTypeName)
+            if (parentFieldName != null) {
+                propertyBuilder.embeddedParentField(parentFieldName)
+            }
 
             // Handle primitive vs non-primitive flags
             val isPrimitive = embeddedFieldType.kind.isPrimitive
@@ -270,8 +347,14 @@ class Properties(
             }
             if (isPrimitive) propertyBuilder.typeNotNull()
 
-            // Embedded flat properties are not field-accessible on the entity (they don't exist as fields)
-            // parsedElement is left null (similar to virtual properties)
+            // Propagate @NameInDb from embedded field (prefix + custom name)
+            val nameInDb = embeddedField.getAnnotation(NameInDb::class.java)
+            if (nameInDb != null && nameInDb.value.isNotEmpty()) {
+                propertyBuilder.dbName(prefix + nameInDb.value)
+            }
+
+            // Propagate @Index, @Unique from embedded field
+            parseIndexAndUniqueAnnotations(embeddedField, propertyBuilder, false)
         }
     }
 
@@ -752,6 +835,8 @@ class Properties(
         private const val INDEX_MAX_VALUE_LENGTH_MAX = 450
 
         private const val BOXSTORE_FIELD_NAME = "__boxStore"
+
+        private const val MAX_EMBEDDED_DEPTH = 5
     }
 
 }

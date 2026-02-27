@@ -206,6 +206,12 @@ public class Property implements HasParsedElement {
             return this;
         }
 
+        /** For nested embedded: sets the field name of the parent embedded object. */
+        public PropertyBuilder embeddedParentField(String parentFieldName) {
+            property.embeddedParentFieldName = parentFieldName;
+            return this;
+        }
+
         public PropertyBuilder virtualTargetName(String virtualTargetName) {
             property.virtualTargetName = virtualTargetName;
             return this;
@@ -281,6 +287,9 @@ public class Property implements HasParsedElement {
 
     /** For embedded properties: simple type name of the embedded class (e.g. "Address"). */
     private String embeddedFieldType;
+
+    /** For nested embedded properties: the field name of the parent embedded object (e.g. "address" for "address_geo"). Null for top-level embedded. */
+    private String embeddedParentFieldName;
 
     /** For virtual properties, this is target host where the property actually is located (e.g. a {@link ToOne}). */
     private String virtualTargetName;
@@ -520,6 +529,11 @@ public class Property implements HasParsedElement {
 
     public String getEmbeddedFieldType() {
         return embeddedFieldType;
+    }
+
+    /** For nested embedded: the field name of the parent embedded object, or null for top-level. */
+    public String getEmbeddedParentFieldName() {
+        return embeddedParentFieldName;
     }
 
     /**
