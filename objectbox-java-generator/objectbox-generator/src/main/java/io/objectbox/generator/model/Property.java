@@ -194,6 +194,30 @@ public class Property implements HasParsedElement {
             return this;
         }
 
+        /**
+         * Marks this property as synthetic output of an {@code @Embedded} flatten.
+         * <p>
+         * Distinct from {@link #virtualTargetName}: embedded properties are <b>not</b> virtual.
+         * The bytecode transformer injects a real {@code transient} field with exactly this
+         * property's name onto the entity class; JNI sets it directly by name during reads.
+         * <p>
+         * This metadata exists so that codegen for {@code put()} can emit a value expression
+         * that dereferences through the embedded container (e.g. {@code entity.price.currency})
+         * rather than the default {@code entity.priceCurrency} (which doesn't exist at
+         * annotation-processing time — it's injected post-process).
+         *
+         * @param origin the {@link EmbeddedField} container that produced this synthetic property
+         * @param sourceFieldName the original field name inside the embedded type (e.g. {@code currency})
+         * @param sourceFieldAccessible {@code true} if the inner field is not private
+         *   (codegen can use {@code container.currency}), else needs {@code container.getCurrency()}
+         */
+        public PropertyBuilder embeddedOrigin(EmbeddedField origin, String sourceFieldName, boolean sourceFieldAccessible) {
+            property.embeddedOrigin = origin;
+            property.embeddedSourceFieldName = sourceFieldName;
+            property.embeddedSourceFieldAccessible = sourceFieldAccessible;
+            return this;
+        }
+
         public PropertyBuilder virtualTargetValueExpression(String virtualTargetValueExpression) {
             property.virtualTargetValueExpression = virtualTargetValueExpression;
             return this;
@@ -257,6 +281,22 @@ public class Property implements HasParsedElement {
     private String virtualTargetName;
 
     private String virtualTargetValueExpression;
+
+    /**
+     * If this property is a synthetic product of an {@code @Embedded} flatten, the container
+     * that produced it. {@code null} for ordinary properties. See {@link #isEmbedded()}.
+     * <p>
+     * <b>Orthogonal to {@link #virtualTargetName}</b>: embedded properties are NOT virtual —
+     * a real field with this property's name is injected onto the entity class by the bytecode
+     * transformer, and JNI sets it directly during reads.
+     */
+    private EmbeddedField embeddedOrigin;
+
+    /** Original field name inside the embedded type (e.g. {@code currency} for a property named {@code priceCurrency}). */
+    private String embeddedSourceFieldName;
+
+    /** {@code true} if {@link #embeddedSourceFieldName} is a non-private field (direct access in generated code). */
+    private boolean embeddedSourceFieldAccessible;
 
     private String getterMethodName;
 
@@ -486,6 +526,47 @@ public class Property implements HasParsedElement {
 
     public String getVirtualTargetName() {
         return virtualTargetName;
+    }
+
+    /**
+     * {@code true} if this property was produced by flattening an {@code @Embedded} container field.
+     * <p>
+     * Implies: this property's {@link #getPropertyName() name} is synthetic (prefixed); at
+     * annotation-processing time no such field exists on the entity class (it is injected later
+     * by the bytecode transformer). Codegen for {@code put()} must therefore dereference through
+     * {@link #getEmbeddedOrigin()} instead of the default {@link #getValueExpression()}.
+     * <p>
+     * Not to be confused with {@link #isVirtual()}: embedded properties are NOT virtual — the
+     * native layer DOES set a field of this name on the entity (the transformer-injected one).
+     */
+    public boolean isEmbedded() {
+        return embeddedOrigin != null;
+    }
+
+    /**
+     * The {@link EmbeddedField} container that produced this synthetic property, or {@code null}
+     * if this is an ordinary property. See {@link #isEmbedded()}.
+     */
+    @Nullable
+    public EmbeddedField getEmbeddedOrigin() {
+        return embeddedOrigin;
+    }
+
+    /**
+     * Original field name inside the embedded type, e.g. {@code currency} for synthetic property
+     * {@code priceCurrency}. Only meaningful if {@link #isEmbedded()}.
+     */
+    public String getEmbeddedSourceFieldName() {
+        return embeddedSourceFieldName;
+    }
+
+    /**
+     * {@code true} if the embedded type's source field is non-private — generated code can use
+     * direct field access ({@code container.currency}) rather than a getter ({@code container.getCurrency()}).
+     * Only meaningful if {@link #isEmbedded()}.
+     */
+    public boolean isEmbeddedSourceFieldAccessible() {
+        return embeddedSourceFieldAccessible;
     }
 
     public String getGetterMethodName() {

@@ -45,9 +45,19 @@ class PropertyCollector {
     public PropertyCollector(Entity entity) {
         propertiesByType = Multimap.create();
         for (Property property : entity.getProperties()) {
-            if (!property.isPrimaryKey()) {
-                propertiesByType.putElement(property.getPropertyType(), property);
+            if (property.isPrimaryKey()) {
+                continue;
             }
+            if (property.isEmbedded()) {
+                // M1: @Embedded synthetic properties are model-only until M2 lands.
+                // Their default getValueExpression() would emit entity.get<SyntheticName>() —
+                // a method that doesn't exist at APT time (the bytecode transformer injects the
+                // backing field post-process, and there is no getter). M2 will remove this skip
+                // and teach appendProperty() to dereference through the embedded container instead,
+                // with a null-guard on the container field.
+                continue;
+            }
+            propertiesByType.putElement(property.getPropertyType(), property);
         }
         idProperty = entity.getPkProperty();
         if (idProperty == null) {

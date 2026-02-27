@@ -60,6 +60,8 @@ public class Entity implements HasParsedElement {
     private final List<ToOne> toOneRelations;
     private final List<ToManyBase> toManyRelations;
     private final List<ToManyBase> incomingToManyRelations;
+    /** {@code @Embedded} container fields — see {@link EmbeddedField}. Synthetic properties they produce live in {@link #properties}. */
+    private final List<EmbeddedField> embeddedFields;
     private final Collection<String> additionalImportsDao;
 
     private String dbName;
@@ -91,6 +93,7 @@ public class Entity implements HasParsedElement {
         toOneRelations = new ArrayList<>();
         toManyRelations = new ArrayList<>();
         incomingToManyRelations = new ArrayList<>();
+        embeddedFields = new ArrayList<>();
         additionalImportsDao = new TreeSet<>();
         hasAllArgsConstructor = false;
     }
@@ -197,6 +200,23 @@ public class Entity implements HasParsedElement {
         return this;
     }
 
+    /**
+     * Registers an {@code @Embedded} container field.
+     * <p>
+     * The container's {@link EmbeddedField#getName() name} is tracked in the entity's unique-name
+     * set — a subsequent {@link #addProperty} or {@link #addToOne}/{@link #addToMany} with the same
+     * name will throw. The synthetic flattened properties produced by this container should be added
+     * separately via {@link #addProperty} (each with its own prefixed name), then linked back via
+     * {@link EmbeddedField#addProperty}.
+     *
+     * @throws ModelException if another property, relation, or embedded field already uses this name.
+     */
+    public Entity addEmbedded(EmbeddedField embedded) throws ModelException {
+        trackUniqueName(names, embedded.getName(), embedded);
+        embeddedFields.add(embedded);
+        return this;
+    }
+
     public Schema getSchema() {
         return schema;
     }
@@ -284,6 +304,26 @@ public class Entity implements HasParsedElement {
 
     public boolean hasRelations() {
         return !toOneRelations.isEmpty() || !toManyRelations.isEmpty();
+    }
+
+    /**
+     * {@code true} if this entity has one or more {@code @Embedded} container fields.
+     * <p>
+     * Used by codegen templates to decide whether to emit the {@code attachEmbedded()} override
+     * in the generated Cursor, and to gate null-guard blocks in {@code put()}.
+     */
+    public boolean hasEmbedded() {
+        return !embeddedFields.isEmpty();
+    }
+
+    /**
+     * The list of {@code @Embedded} container fields on this entity.
+     * <p>
+     * Each entry's {@link EmbeddedField#getProperties() properties} list holds the synthetic
+     * flattened properties it produced; those same properties also appear in {@link #getProperties()}.
+     */
+    public List<EmbeddedField> getEmbeddedFields() {
+        return embeddedFields;
     }
 
     public List<ToOne> getToOneRelations() {
@@ -391,6 +431,11 @@ public class Entity implements HasParsedElement {
         }
         for (ToManyBase toMany : toManyRelations) {
             trackUniqueName(names, toMany.getName(), toMany);
+        }
+        for (EmbeddedField embedded : embeddedFields) {
+            // The container name itself occupies a slot in the entity's Java namespace (it IS a field),
+            // even though it has no DB column. Prevents e.g. a regular property shadowing the container.
+            trackUniqueName(names, embedded.getName(), embedded);
         }
     }
 

@@ -22,6 +22,7 @@ import io.objectbox.annotation.ConflictStrategy
 import io.objectbox.annotation.Convert
 import io.objectbox.annotation.DatabaseType
 import io.objectbox.annotation.DefaultValue
+import io.objectbox.annotation.Embedded
 import io.objectbox.annotation.ExternalName
 import io.objectbox.annotation.ExternalType
 import io.objectbox.annotation.HnswIndex
@@ -45,6 +46,7 @@ import io.objectbox.converter.StringFlexMapConverter
 import io.objectbox.converter.StringLongMapConverter
 import io.objectbox.converter.StringMapConverter
 import io.objectbox.generator.IdUid
+import io.objectbox.generator.model.EmbeddedField
 import io.objectbox.generator.model.Entity
 import io.objectbox.generator.model.ModelException
 import io.objectbox.generator.model.Property
@@ -53,9 +55,12 @@ import io.objectbox.model.PropertyFlags
 import java.util.*
 import javax.lang.model.element.AnnotationMirror
 import javax.lang.model.element.Element
+import javax.lang.model.element.ElementKind
 import javax.lang.model.element.ExecutableElement
 import javax.lang.model.element.Modifier
+import javax.lang.model.element.TypeElement
 import javax.lang.model.element.VariableElement
+import javax.lang.model.type.DeclaredType
 import javax.lang.model.type.TypeMirror
 import javax.lang.model.util.ElementFilter
 import javax.lang.model.util.Elements
@@ -129,10 +134,277 @@ class Properties(
             checkNotSuperEntity(field)
             checkNoIndexOrUniqueAnnotation(field, "ToMany")
             relations.parseToMany(entityModel, field)
+        } else if (field.hasAnnotation(Embedded::class.java)) {
+            // @Embedded container field — flatten inner fields into synthetic properties
+            checkNotSuperEntity(field)
+            checkNoIndexOrUniqueAnnotation(field, "@Embedded")
+            parseEmbedded(field)
         } else {
             // regular property
             parseProperty(field)
         }
+    }
+
+    /**
+     * Handles an `@Embedded` container field: walks the embedded type's fields and produces
+     * one synthetic [Property] per inner field, each with a prefixed name, then records an
+     * [EmbeddedField] on the entity linking container → synthetic properties.
+     *
+     * ### What this does
+     * 1. Resolves the effective prefix from `@Embedded(prefix=...)` and the [Embedded.USE_FIELD_NAME]
+     *    sentinel.
+     * 2. Resolves the embedded type's [TypeElement] and walks its instance fields, applying the same
+     *    skip rules as [parseField] (static / transient / `@Transient`).
+     * 3. For each surviving inner field, resolves its [PropertyType] via [TypeHelper.getPropertyType]
+     *    and adds a synthetic property to the entity with a prefixed name. The property carries
+     *    [EmbeddedField] origin metadata (see [Property.PropertyBuilder.embeddedOrigin]).
+     * 4. Registers the [EmbeddedField] itself on the entity for M2 codegen
+     *    (Cursor `put()` null-guard + `attachEmbedded()` override generation).
+     *
+     * ### What this does NOT do (yet)
+     * - No constraint validation (target is not `@Entity`, no-arg ctor exists, no nested
+     *   `@Embedded`). That is M1.3 — failures in those cases currently surface as downstream
+     *   errors (unsupported type for inner fields, etc.) or silently pass.
+     * - No codegen changes. Flattened properties land in the model; `PropertyCollector` / templates
+     *   are updated in M2.
+     *
+     * ### Intentional design choices
+     * - Synthetic properties are **NOT** marked `fieldAccessible`. At APT time no field named
+     *   e.g. `priceCurrency` exists on the entity (the bytecode transformer injects it later).
+     *   Leaving this unset means the default [Property.getValueExpression] would emit
+     *   `getPriceCurrency()` — also non-existent — so if M2's `PropertyCollector` forgets to
+     *   short-circuit on [Property.isEmbedded], the generated Cursor will **fail to compile**
+     *   loudly rather than silently reading garbage.
+     * - Synthetic properties are **NOT** marked virtual. The transformer-injected field IS real;
+     *   JNI must set it directly by `Property.name` during reads.
+     */
+    private fun parseEmbedded(field: VariableElement) {
+        val annotation = field.getAnnotation(Embedded::class.java)
+        val fieldName = field.simpleName.toString()
+
+        // ─── Resolve prefix: sentinel → field name; explicit "" → no prefix; else → as given ───
+        val rawPrefix = annotation.prefix
+        val effectivePrefix = if (rawPrefix == Embedded.USE_FIELD_NAME) fieldName else rawPrefix
+
+        // ─── Resolve embedded type element to walk its fields ───
+        val fieldType = field.asType()
+        if (fieldType !is DeclaredType) {
+            // Primitive, array, etc. — cannot be a container. M1.3 will sharpen this message.
+            messages.error(
+                "@Embedded field '$fieldName' must be a declared class type, got $fieldType.",
+                field
+            )
+            return
+        }
+        val typeElement = fieldType.asElement() as? TypeElement
+        if (typeElement == null) {
+            messages.error(
+                "@Embedded field '$fieldName' type could not be resolved to a class element.",
+                field
+            )
+            return
+        }
+        val typeFqn = typeElement.qualifiedName.toString()
+        val typeSimple = typeElement.simpleName.toString()
+
+        // ─── M1.3 type-level validation — reject before polluting the entity model ───
+        if (!validateEmbeddedType(fieldName, typeElement, typeSimple, field)) {
+            return
+        }
+
+        // ─── Create and register the container model BEFORE synthesizing properties ───
+        // Registering first reserves the container name in the entity's unique-name set,
+        // so a subsequent synthetic prop with the same name (e.g. prefix="" + inner field
+        // name == container name) fails fast via trackUniqueName().
+        val isContainerFieldAccessible = !field.modifiers.contains(Modifier.PRIVATE)
+        val embedded = EmbeddedField(
+            name = fieldName,
+            isFieldAccessible = isContainerFieldAccessible,
+            prefix = effectivePrefix,
+            typeFullyQualifiedName = typeFqn,
+            typeSimpleName = typeSimple
+        )
+        embedded.setParsedElement(field)
+        try {
+            entityModel.addEmbedded(embedded)
+        } catch (e: ModelException) {
+            messages.error("Could not add @Embedded container: ${e.message}", field)
+            return
+        }
+
+        // ─── Walk inner fields, applying the same skip rules as parseField() ───
+        val innerFields = ElementFilter.fieldsIn(typeElement.enclosedElements)
+        var producedCount = 0
+        for (innerField in innerFields) {
+            val innerModifiers = innerField.modifiers
+            if (innerModifiers.contains(Modifier.STATIC)
+                || innerModifiers.contains(Modifier.TRANSIENT)
+                || innerField.hasAnnotation(Transient::class.java)
+            ) {
+                continue
+            }
+
+            val innerFieldName = innerField.simpleName.toString()
+
+            // ─── M1.3: Nested @Embedded — explicit rejection BEFORE type resolution ───
+            // Without this check, the inner @Embedded annotation is silently ignored and the
+            // user gets the generic "unsupported type" error below (getPropertyType returns
+            // null for the nested POJO). That message gives no hint that NESTING is the issue;
+            // users might think they need @Convert. This check intercepts with a clear message.
+            //
+            // Single-level @Embedded only in M1 — recursive flattening would need multi-segment
+            // container paths (entity.price.cur.code), compound null-guards, and cycle detection.
+            // Deferred as YAGNI until a concrete use case demands it.
+            if (innerField.hasAnnotation(Embedded::class.java)) {
+                messages.error(
+                    "@Embedded '$fieldName': nested @Embedded on inner field '$innerFieldName' " +
+                            "is not supported. Flatten '$typeSimple' manually or remove @Embedded " +
+                            "from '$typeSimple.$innerFieldName'.",
+                    innerField
+                )
+                return
+            }
+
+            val innerTypeMirror = innerField.asType()
+            val innerPropertyType = typeHelper.getPropertyType(innerTypeMirror)
+            if (innerPropertyType == null) {
+                // Only directly-supported types inside embedded containers — no @Convert on
+                // inner fields (M1 scope). Users needing custom types should wrap them on the
+                // ENTITY level with @Convert, not inside the embedded POJO.
+                messages.error(
+                    "@Embedded '$fieldName' inner field '$innerFieldName' has unsupported type " +
+                            "'$innerTypeMirror'. Only types directly supported by ObjectBox are allowed " +
+                            "inside an @Embedded container (no @Convert on inner fields yet).",
+                    innerField
+                )
+                return
+            }
+
+            val syntheticName = embedded.syntheticNameFor(innerFieldName)
+
+            // Add synthetic property to the entity with the prefixed name.
+            // This is a REAL property: it gets a DB column, a model ID, a static Property field
+            // in the generated EntityInfo_ class, and JNI will set a field of this name on reads.
+            val builder: Property.PropertyBuilder = try {
+                entityModel.addProperty(innerPropertyType, syntheticName)
+            } catch (e: ModelException) {
+                messages.error(
+                    "Could not add synthetic @Embedded property '$syntheticName' " +
+                            "(from '$fieldName.$innerFieldName'): ${e.message}",
+                    field
+                )
+                return
+            }
+
+            // ─── Set flags mirroring supportedPropertyBuilderOrNull() — ───
+            // the INNER field's type determines nullability/primitiveness, not the container.
+            val innerIsPrimitive = innerTypeMirror.kind.isPrimitive
+            if (!innerIsPrimitive && (innerPropertyType.isScalar || typeHelper.isStringList(innerTypeMirror))) {
+                builder.nonPrimitiveFlag()
+            }
+            if (innerPropertyType == PropertyType.StringArray && typeHelper.isStringList(innerTypeMirror)) {
+                builder.isList()
+            }
+            if (innerIsPrimitive) {
+                builder.typeNotNull()
+            }
+
+            // ─── Embedded-origin metadata for M2 codegen ───
+            val innerIsFieldAccessible = !innerField.modifiers.contains(Modifier.PRIVATE)
+            builder.embeddedOrigin(embedded, innerFieldName, innerIsFieldAccessible)
+            // parsedElement → the inner field (for error reporting / diagnostics)
+            builder.property.parsedElement = innerField
+
+            embedded.addProperty(builder.property)
+            producedCount++
+        }
+
+        if (producedCount == 0) {
+            messages.error(
+                "@Embedded '$fieldName' of type '$typeSimple' has no persistable fields " +
+                        "(all fields are static, transient, or @Transient).",
+                field
+            )
+        }
+    }
+
+    /**
+     * M1.3 — Validates that the `@Embedded` field's type is a legal container.
+     *
+     * Checks run **before** any model mutation so that rejection doesn't leave a half-built
+     * [EmbeddedField] or orphaned synthetic properties in the entity. Each check addresses a
+     * specific failure mode that would otherwise surface far downstream (at M2 codegen or,
+     * worse, at runtime):
+     *
+     * 1. **Not an `@Entity`** — Embedding an entity would flatten its `@Id` into the owner as
+     *    a regular column (semantic nonsense). Users wanting entity composition need relations.
+     *    Without this check, compilation succeeds silently today (the `@Id` on the inner type
+     *    is ignored by [parseEmbedded] since it only calls [TypeHelper.getPropertyType]).
+     *
+     * 2. **Concrete class** — M2's generated `attachEmbedded()` emits `new TypeName()` to
+     *    hydrate the container. Interfaces and abstract classes cannot be instantiated, so
+     *    the generated Cursor would fail to compile — but at a layer far removed from the
+     *    actual mistake. We catch it here with a precise pointer.
+     *
+     * 3. **No-arg constructor** — Same reason as (2). Java suppresses the default ctor if ANY
+     *    explicit ctor is declared, so this is easy to hit accidentally. The check mirrors
+     *    [io.objectbox.processor.ObjectBoxProcessor.hasNoArgConstructor] but inlined here to
+     *    keep the embedded validation cohesive.
+     *
+     * @return `true` if all checks pass; `false` if an error was reported and processing
+     *         should abort for this field.
+     */
+    private fun validateEmbeddedType(
+        fieldName: String,
+        typeElement: TypeElement,
+        typeSimple: String,
+        errorElement: Element
+    ): Boolean {
+        // ─── 1. Must NOT itself be an @Entity ───
+        // Note: FQN used because `io.objectbox.generator.model.Entity` (the model class) is
+        // already imported and would shadow the annotation.
+        if (typeElement.getAnnotation(io.objectbox.annotation.Entity::class.java) != null) {
+            messages.error(
+                "@Embedded '$fieldName': type '$typeSimple' is an @Entity. Embedded types " +
+                        "must be plain value objects — use a ToOne or ToMany relation instead.",
+                errorElement
+            )
+            return false
+        }
+
+        // ─── 2. Must be a concrete class (not interface, enum, annotation, or abstract) ───
+        // A DeclaredType can be any of these; the M1.2 !is DeclaredType check only catches
+        // primitives/arrays. ElementKind.CLASS excludes interfaces/enums/annotations; the
+        // abstract modifier check catches `abstract class Foo`.
+        if (typeElement.kind != ElementKind.CLASS
+            || typeElement.modifiers.contains(Modifier.ABSTRACT)
+        ) {
+            messages.error(
+                "@Embedded '$fieldName': type '$typeSimple' must be a concrete class " +
+                        "(not an interface, enum, or abstract class) — the generated cursor " +
+                        "needs to instantiate it via `new $typeSimple()`.",
+                errorElement
+            )
+            return false
+        }
+
+        // ─── 3. Must have a no-argument constructor ───
+        // Visibility is NOT checked: the generated Cursor lives in the same package as the
+        // entity, and the transformer can inject a bridge if needed. We only require the
+        // *shape* (zero params). Mirrors ObjectBoxProcessor.hasNoArgConstructor().
+        val hasNoArg = ElementFilter.constructorsIn(typeElement.enclosedElements)
+            .any { it.parameters.isEmpty() }
+        if (!hasNoArg) {
+            messages.error(
+                "@Embedded '$fieldName': type '$typeSimple' must have a no-argument " +
+                        "constructor — the generated cursor instantiates the container " +
+                        "via `new $typeSimple()` when hydrating reads.",
+                errorElement
+            )
+            return false
+        }
+
+        return true
     }
 
     private fun checkNotSuperEntity(field: VariableElement) {
