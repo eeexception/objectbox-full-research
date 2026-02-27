@@ -119,7 +119,26 @@ object EmbeddedTransform {
          * Primitives are keywords (`long`, `int`), references are FQNs (`java.lang.String`).
          */
         val javaType: String,
-    )
+    ) {
+        /**
+         * True for reference-typed fields (can hold null → usable as null-detection signal),
+         * false for the eight JVM primitives (can't be null → ambiguous between "DB was NULL"
+         * and "DB stored the zero-value"). Arrays are reference types → true.
+         *
+         * Consumed by the hydration-guard builder: only object-typed synthetics participate in
+         * the `if ($1.x != null || ...)` predicate that decides hydrate-vs-nullify. See
+         * [buildAttachEmbeddedBody] AT4 block.
+         */
+        val isObjectType: Boolean
+            get() = javaType !in JVM_PRIMITIVE_KEYWORDS
+
+        companion object {
+            // Frozen set — the JLS eight. `void` can't appear on a field so excluded.
+            private val JVM_PRIMITIVE_KEYWORDS = hashSetOf(
+                "boolean", "byte", "char", "short", "int", "long", "float", "double",
+            )
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
     // Phase A — entity
@@ -369,36 +388,112 @@ object EmbeddedTransform {
      * ```
      *
      * Design notes:
-     *  - Always-hydrate: the container is never null post-read, even if every DB column was NULL
-     *    (all inner fields then hold their Java defaults). Matches JPA `@Embedded` semantics and
-     *    avoids brittle was-this-zero-or-default? heuristics.
-     *  - Build-into-local-then-assign: `__emb.x = ...; $1.price = __emb;` (not `$1.price.x = ...`
-     *    directly). This dodges the null-check on `$1.price` — the entity's container field is
-     *    whatever the user's constructor/initializer left it (often null), and we're about to
-     *    overwrite it anyway. The local-variable approach is one less branch per inner field.
-     *  - Per-container `{}` scopes let every container's local share the name `__emb` without
-     *    collision — simpler than suffixing (`__emb0`, `__emb1`).
-     *  - Direct field access (`__emb.currency`) not setters — matches the APT's write-path which
-     *    also uses direct access via the hoisted `__emb_price.currency`. If APT ever switches to
-     *    getter/setter dispatch for embedded, both halves change together.
-     *  - Nested `@Embedded` chains: [containers] is flat, parent-before-child (per
-     *    [discoverEmbeddedContainers]). The parent's block runs first → `$1.price` is non-null
-     *    when the nested block assigns `$1.price.cur = __emb`. [EmbeddedContainer.assignmentTargetExpression]
-     *    builds the `$1.price.cur` path by walking the parent chain.
+     *  - **Null-detection (AT4)**: if the container was saved as null, the write path skipped
+     *    every flat property (collect ID = 0) → DB stores nothing → on read the native layer
+     *    leaves object-typed synthetic fields as null and primitive ones as zero. We use the
+     *    object-typed fields as the null-signal: if EVERY object-typed synthetic is null, the
+     *    container is presumed null and we set it to null explicitly; otherwise we hydrate.
+     *    Primitives are EXCLUDED from the guard — they're ambiguous (zero could mean "DB was
+     *    NULL" or "user stored zero"). Consequence: an all-primitive container cannot null-detect
+     *    and ALWAYS hydrates; users needing null round-trip on such containers should use wrapper
+     *    types (`Integer` instead of `int`) for at least one field.
+     *  - **Nested parent-guard**: a nested container's block is preceded by
+     *    `if (<parentTarget> != null)` — if the parent was nullified by ITS guard, the nested
+     *    block must skip entirely (both hydrate AND nullify would NPE on `$1.price.cur`). The
+     *    parent-first iteration order guarantees the parent's block has already run by the
+     *    time the nested block's guard checks the parent target.
+     *  - **Build-into-local-then-assign**: `__emb.x = ...; $1.price = __emb;` (not
+     *    `$1.price.x = ...` directly). One less branch per inner field; the local-variable
+     *    approach dodges the need to null-check `$1.price` before each inner assignment.
+     *  - **Per-container `{}` scopes** let every container's local share the name `__emb`
+     *    without collision — simpler than suffixing (`__emb0`, `__emb1`).
+     *  - **Direct field access** (`__emb.currency`) not setters — matches the APT's write-path
+     *    which also uses direct access. If APT switches to getter/setter dispatch, both halves
+     *    change together.
+     *
+     * Generated shape for `price: Money{currency: String, amount: long}` (canonical AT4 case):
+     * ```java
+     * {
+     *     if ($1 == null) return;
+     *     {
+     *         if ($1.priceCurrency != null) {
+     *             com.example.Money __emb = new com.example.Money();
+     *             __emb.currency = $1.priceCurrency;
+     *             __emb.amount   = $1.priceAmount;
+     *             $1.price = __emb;
+     *         } else {
+     *             $1.price = null;
+     *         }
+     *     }
+     * }
+     * ```
+     *
+     * For a nested chain `price: Money{amount: long, @Embedded cur: Currency{code: String, ...}}`:
+     * ```java
+     * {
+     *     if ($1 == null) return;
+     *     { /* Money: primitive-only → always-hydrate, no guard */
+     *         com.example.Money __emb = new com.example.Money();
+     *         __emb.amount = $1.priceAmount;
+     *         $1.price = __emb;
+     *     }
+     *     if ($1.price != null) { /* nested: parent-guard first */
+     *         if ($1.priceCurCode != null) {
+     *             com.example.Currency __emb = new com.example.Currency();
+     *             __emb.code = $1.priceCurCode;
+     *             /* ... */
+     *             $1.price.cur = __emb;
+     *         } else {
+     *             $1.price.cur = null;
+     *         }
+     *     }
+     * }
+     * ```
      */
     fun buildAttachEmbeddedBody(containers: List<EmbeddedContainer>): String = buildString {
         append("{")
         append("if ($1 == null) return;")
         containers.forEach { c ->
+            val target = c.assignmentTargetExpression()  // `$1.price` or `$1.price.cur` etc.
+
+            // ── Nested: guard on parent non-null. ──────────────────────────────────────────
+            // If parent was nullified by its own hydration guard, dereferencing it here (for
+            // either the hydrate assignment OR the else-nullify) would NPE. Wrap the entire
+            // per-container block in `if (parentTarget != null)`. For root containers there's
+            // no parent → no wrapper (the top-level `$1 == null` check already covers it).
+            //
+            // We emit this guard unconditionally for nested containers, even when the parent
+            // is known to always-hydrate (primitive-only) and the guard is therefore never
+            // false at runtime. The alternative — checking at build time whether the parent
+            // can nullify — saves one branch but couples the nested block's shape to the
+            // parent's field-type mix. Not worth the complexity; the JIT will drop the
+            // always-true branch anyway.
+            val parentTarget = c.parent?.assignmentTargetExpression()
+            if (parentTarget != null) append("if ($parentTarget != null) ")
+
             append("{")
+
+            // ── Hydration guard: OR-join all object-typed synthetics. ──────────────────────
+            // Null if no object-typed synthetics exist (all-primitive container) — that's the
+            // "can't detect, always hydrate" fallback.
+            val objectSynthetics = c.syntheticFields.filter { it.isObjectType }
+            val hydrationGuard = if (objectSynthetics.isEmpty()) null
+                else objectSynthetics.joinToString(" || ") { "\$1.${it.name} != null" }
+
+            if (hydrationGuard != null) append("if ($hydrationGuard) {")
+
+            // ── Hydrate block (unchanged from always-hydrate impl). ────────────────────────
             append("${c.typeFqn} __emb = new ${c.typeFqn}();")
             c.syntheticFields.forEach { sf ->
                 append("__emb.${sf.innerFieldName} = \$1.${sf.name};")
             }
-            // Root → `$1.price = __emb;`, nested → `$1.price.cur = __emb;` — the model method
-            // walks the parent chain so this line works uniformly at any depth. Ordering
-            // contract (parent-first list iteration) guarantees the parent deref is safe here.
-            append("${c.assignmentTargetExpression()} = __emb;")
+            append("$target = __emb;")
+
+            // ── Else: explicitly nullify. ──────────────────────────────────────────────────
+            // Without this, the user's constructor-default (if any) would survive post-read,
+            // breaking AT4 round-trip (null-saved → null-read).
+            if (hydrationGuard != null) append("} else {$target = null;}")
+
             append("}")
         }
         append("}")

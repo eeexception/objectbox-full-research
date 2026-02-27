@@ -41,6 +41,18 @@ import java.lang.annotation.Target;
  *     &#64;Embedded public Money price; // stored as flat columns priceCurrency, priceAmount
  * }
  * </pre>
+ *
+ * <b>Null handling.</b> Saving an entity with a {@code null} embedded container stores null for every flattened column.
+ * On read, the container reference is restored to {@code null} — <b>provided the embedded type has
+ * at least one reference-typed (non-primitive) field</b>. Null-detection works by checking whether
+ * any object-typed flat column read back as non-null; if all are null the container is presumed to
+ * have been null at save time.
+ * <p>
+ * <b>Limitation:</b> an embedded type whose fields are <i>all</i> primitives ({@code int},
+ * {@code long}, {@code double}, …) cannot distinguish a null container from one whose fields all
+ * happen to hold the zero value — reading such an entity always returns a populated container.
+ * If null round-trip matters for an all-primitive embeddable, use a wrapper type ({@code Long}
+ * instead of {@code long}) on at least one field to provide a null-detection signal.
  */
 @Retention(RetentionPolicy.CLASS)
 @Target(ElementType.FIELD)

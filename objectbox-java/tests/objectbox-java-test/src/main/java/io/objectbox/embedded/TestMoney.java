@@ -24,12 +24,15 @@ package io.objectbox.embedded;
  * (double). A public no-arg constructor is REQUIRED (the read-path hydration instantiates this
  * class via {@code new TestMoney()} then populates fields directly).
  * <p>
- * Intentionally covers the two most asymmetric primitive behaviours:
+ * Intentionally mixes an object-typed field with a primitive:
  * <ul>
- *   <li>{@link #currency} — reference type → DB null maps back to Java {@code null}</li>
- *   <li>{@link #amount} — primitive {@code double} → DB absent maps back to {@code 0.0}</li>
+ *   <li>{@link #currency} — reference type → CAN be null → usable as null-detection signal
+ *       in the hydration guard (see {@link TestBillCursor#attachEmbedded}).</li>
+ *   <li>{@link #amount} — primitive {@code double} → CANNOT distinguish DB-absent from stored-
+ *       zero → excluded from the guard.</li>
  * </ul>
- * so I2 (null-container write) can assert both sentinels in one round-trip.
+ * This is the canonical AT4 shape: one object-typed field gives I2 (null-container round-trip)
+ * a reliable signal that the container was null at write time.
  */
 public class TestMoney {
 

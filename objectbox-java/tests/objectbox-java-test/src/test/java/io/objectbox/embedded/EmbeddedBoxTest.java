@@ -49,9 +49,9 @@ import static org.junit.Assert.assertTrue;
  *   <li><b>{@code Cursor.attachEmbedded} wiring is complete</b> across every read entry point
  *       ({@code Cursor.get/getAll}, {@code Query.find/findFirst/findUnique/find(offset,limit)}).
  *       A missing hook at any call site yields {@code result.price == null}.</li>
- *   <li><b>Null-container write semantics</b> — {@code put()} with {@code entity.price == null}
- *       stores columns as absent; reads come back as Java defaults inside a fresh non-null
- *       container.</li>
+ *   <li><b>Null-container round-trip</b> — {@code put()} with {@code entity.price == null}
+ *       stores columns as absent; the read-path hydration guard detects all-null object-typed
+ *       synthetics and restores {@code entity.price = null}. End-to-end null fidelity.</li>
  * </ul>
  *
  * <h3>What this does NOT validate (covered elsewhere)</h3>
@@ -145,17 +145,28 @@ public class EmbeddedBoxTest extends AbstractObjectBoxTest {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────────
-    // I2 — Null-container write: put() with entity.price == null.
+    // I2 — Null-container round-trip (Acceptance Test AT4).
     //
-    // Tests the null-guard in put()'s hoisting: `__id2 = __emb_price != null ? __ID_... : 0`.
-    // When the container is null, every embedded property's ID is 0 → native treats those slots
-    // as ABSENT (doesn't write a value). On read, JNI's SetXxxField skips absent properties,
-    // leaving the synthetic flat fields at Java defaults (null for String, 0.0 for double).
-    // attachEmbedded then copies those defaults into a FRESH TestMoney.
+    // Write half — put() with entity.price == null:
+    //   put()'s hoisting null-guards every embedded property's ID: `__id2 = __emb_price != null
+    //   ? __ID_... : 0`. When the container is null, every ID is 0 → native treats those slots as
+    //   ABSENT (doesn't write a value, column stays DB-NULL).
     //
-    // Key assertion: result.price is NOT null even though we put null. This is the "always-hydrate"
-    // policy (§3.3 of the plan) — matches JPA @Embedded semantics, simpler than a heuristic
-    // "all-defaults ⇒ container-null" check.
+    // Read half — get() restores null:
+    //   JNI skips SetXxxField for absent columns → synthetic flat fields stay at Java defaults
+    //   (null for String, 0.0 for double). attachEmbedded's hydration guard checks object-typed
+    //   synthetics: `if (priceCurrency != null) { ...hydrate... } else { entity.price = null; }`.
+    //   Guard fails (priceCurrency == null) → container explicitly nullified.
+    //
+    // THIS IS THE AT4 END-TO-END PROOF: null in → native → null out. Runs against real JNI — if
+    // the native column-absent contract ever changed (e.g. JNI started writing "" instead of
+    // skipping SetObjectField), the guard would see non-null and wrongly hydrate. This test
+    // catches that drift.
+    //
+    // Note the asymmetry that makes this work: `priceCurrency` (String, object-typed) IS the null
+    // signal; `priceAmount` (primitive double) is NOT — a primitive can't distinguish "column was
+    // absent" from "column held 0.0". The guard builder only uses object-typed synthetics for
+    // exactly this reason. An all-primitive embeddable would always-hydrate; see @Embedded javadoc.
     // ─────────────────────────────────────────────────────────────────────────────────────────────
 
     @Test
@@ -167,23 +178,22 @@ public class EmbeddedBoxTest extends AbstractObjectBoxTest {
         assertNotNull(result);
         assertEquals("regular property unaffected by null container", "NoPrice", result.provider);
 
-        assertNotNull(
-                "result.price must NOT be null even when put with null — attachEmbedded " +
-                        "ALWAYS instantiates the container (always-hydrate policy). The user can " +
-                        "check inner fields for sentinel values to detect the null-at-write case.",
-                result.price
-        );
+        // ── AT4: container saved as null MUST read back as null. ────────────────────────────────
+        // Full chain proven: put()'s container-null → prop-ID 0 → native column-absent → JNI skip
+        // SetObjectField → synthetic priceCurrency stays null → attachEmbedded guard fails →
+        // entity.price explicitly set to null.
+        //
+        // If this fails with result.price != null, diagnose by checking result.priceCurrency:
+        //   - priceCurrency == null BUT price != null → attachEmbedded's else-branch is missing
+        //     or the guard condition is inverted. Check TestBillCursor.attachEmbedded body.
+        //   - priceCurrency != null → native column-absent contract broken (JNI wrote SOMETHING
+        //     for an absent column). Deeper problem, outside @Embedded's scope.
         assertNull(
-                "result.price.currency must be null — container was null at write, so " +
-                        "priceCurrency column was absent, so JNI left the synthetic at Java default " +
-                        "(null for String), and attachEmbedded copied that null into the fresh container.",
-                result.price.currency
-        );
-        assertEquals(
-                "result.price.amount must be 0.0 — same absent-column → Java-default path as " +
-                        "currency, but for a primitive double the default is 0.0 not null. This " +
-                        "asymmetry (ref types → null, primitives → zero) is the documented contract.",
-                0.0, result.price.amount, 0.0
+                "result.price MUST be null (AT4: null-saved → null-read). The attachEmbedded " +
+                        "hydration guard should have seen priceCurrency == null and taken the " +
+                        "else-branch. If non-null, either the guard is wrong or JNI unexpectedly " +
+                        "populated priceCurrency for an absent column.",
+                result.price
         );
     }
 

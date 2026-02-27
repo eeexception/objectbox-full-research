@@ -116,21 +116,28 @@ public final class TestBillCursor extends Cursor<TestBill> {
 
     /**
      * <b>Read path</b> — hydrates the {@link TestBill#price} container from the synthetic flat
-     * fields JNI has just set.
+     * fields JNI has just set (or nullifies it if those flats signal "container was null").
      * <p>
      * Call sequence: {@code nativeGetEntity()} → JNI allocates {@code TestBill} via no-arg ctor
      * → JNI calls {@code SetObjectField(priceCurrency, ...)} + {@code SetDoubleField(priceAmount,
      * ...)} by property name → base {@link Cursor#get(long)} calls {@code attachEmbedded(entity)}
-     * → THIS method copies flats into a fresh {@link TestMoney}.
+     * → THIS method either copies flats into a fresh {@link TestMoney} or sets
+     * {@code entity.price = null}.
      * <p>
      * Body shape matches the transformer's {@code EmbeddedTransform.buildAttachEmbeddedBody()}:
      * <ul>
      *   <li><b>Null-guard first</b> — called unconditionally from every read hook including misses
      *       ({@code get(missingKey)} → null) and iteration-end ({@code next()} → null).</li>
-     *   <li><b>Always-hydrate</b> — {@code entity.price} is NEVER null post-read. If the DB columns
-     *       were absent (e.g. written with container==null), JNI leaves the synthetic flats at
-     *       Java defaults → {@code __emb.currency = null, __emb.amount = 0.0}. No
-     *       "was-this-zero-or-default?" heuristic.</li>
+     *   <li><b>Hydration guard</b> on object-typed synthetic(s): {@code if (priceCurrency != null)}.
+     *       Object-typed flats are the only reliable null-vs-absent signal — a primitive
+     *       {@code double} can't tell DB-NULL apart from stored-zero. If every object-typed flat
+     *       reads back as null, the container is presumed to have been null at write time
+     *       ({@code put()} passes property-ID {@code 0} for every embedded column when the
+     *       container is null → native stores nothing → JNI doesn't call {@code SetObjectField}
+     *       → synthetic stays at its Java default of {@code null}).</li>
+     *   <li><b>Else-nullify</b> — explicitly sets {@code entity.price = null}. Without this the
+     *       user's constructor-default (typically {@code null} but not guaranteed —
+     *       {@code = new Money()} in the ctor is legal) would survive, breaking round-trip.</li>
      *   <li><b>Build-into-local-then-assign</b> — {@code __emb.x = ...; entity.price = __emb;}
      *       not {@code entity.price.x = ...}. Dodges the null-check on the entity's existing
      *       container field (which is whatever the user's ctor left it — typically null).</li>
@@ -142,10 +149,14 @@ public final class TestBillCursor extends Cursor<TestBill> {
     public void attachEmbedded(TestBill entity) {
         if (entity == null) return;
         {
-            TestMoney __emb = new TestMoney();
-            __emb.currency = entity.priceCurrency;
-            __emb.amount = entity.priceAmount;
-            entity.price = __emb;
+            if (entity.priceCurrency != null) {
+                TestMoney __emb = new TestMoney();
+                __emb.currency = entity.priceCurrency;
+                __emb.amount = entity.priceAmount;
+                entity.price = __emb;
+            } else {
+                entity.price = null;
+            }
         }
     }
 }
