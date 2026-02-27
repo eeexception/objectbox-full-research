@@ -438,72 +438,14 @@ class EmbeddedTest : BaseProcessorTest() {
             }
     }
 
-    /**
-     * Nested `@Embedded` (an embedded type itself containing an `@Embedded` field) is out of
-     * scope for M1 — it would require recursive flattening, multi-segment container paths in
-     * the generated Cursor, and compound null-guards.
-     *
-     * Without this check, today the inner `@Embedded` annotation is silently ignored: the
-     * inner-field loop sees `@Embedded Currency cur` as a plain field, `getPropertyType()`
-     * returns null (Currency isn't a supported primitive), and the user gets the generic
-     * "unsupported type" error with no hint that nesting is the issue.
-     */
-    @Test
-    fun embedded_nestedEmbedded_errors() {
-        @Language("Java")
-        val currency =
-            """
-            package com.example;
-
-            public class Currency {
-                public String code;
-                public int decimals;
-                public Currency() {}
-            }
-            """.trimIndent()
-
-        @Language("Java")
-        val money =
-            """
-            package com.example;
-
-            import io.objectbox.annotation.Embedded;
-
-            public class Money {
-                @Embedded public Currency cur;   // ← nested @Embedded
-                public long amount;
-                public Money() {}
-            }
-            """.trimIndent()
-
-        @Language("Java")
-        val bill =
-            """
-            package com.example;
-
-            import io.objectbox.annotation.Entity;
-            import io.objectbox.annotation.Id;
-            import io.objectbox.annotation.Embedded;
-
-            @Entity
-            public class Bill {
-                @Id public long id;
-                @Embedded public Money price;
-            }
-            """.trimIndent()
-
-        TestEnvironment("embedded-nested.json", useTemporaryModelFile = true)
-            .apply {
-                addSourceFile("com.example.Currency", currency)
-                addSourceFile("com.example.Money", money)
-                addSourceFile("com.example.Bill", bill)
-            }
-            .compile()
-            .assertThatIt {
-                failed()
-                hadErrorContaining("@Embedded 'price': nested @Embedded on inner field 'cur' is not supported")
-            }
-    }
+    // ─── embedded_nestedEmbedded_errors() — REMOVED in P2.4 ───
+    // The M1.3 "nested @Embedded not supported" rejection test was deleted when P2.4
+    // added full nesting support (compound prefix flattening + chained hoist). The
+    // positive-path replacement tests live in the P2.4 region below:
+    //   · embedded_nested_compoundPrefixFlattening       — model assertions
+    //   · embedded_nested_cursorEmitsChainedHoistWithNullPropagation — codegen assertions
+    //   · embedded_nested_cycleDetection_errors          — the NEW boundary case
+    // Same lifecycle as G2's @Convert rejection test → removed when P2.2 added support.
 
     /**
      * Prefix collision — a synthetic property's name clashes with an existing property on the
@@ -1095,6 +1037,98 @@ class EmbeddedTest : BaseProcessorTest() {
     }
 
     /**
+     * T3 — Generated `Bill_` (EntityInfo) exposes flattened properties as queryable `Property<Bill>`
+     * constants.
+     *
+     * This is what makes embedded-field queries work: `box.query(Bill_.priceCurrency.equal("USD"))`.
+     * The `entity-info.ftl` template iterates `entity.propertiesColumns` — which includes
+     * embedded-derived synthetic properties exactly like regular ones. No template change was
+     * needed (the plan correctly predicted this), but the template COULD regress independently
+     * of the Cursor/put() path, so it needs its own pin.
+     *
+     * What we assert:
+     * - Each flattened property appears as a `public final static Property<Bill>` constant
+     *   with its SYNTHETIC name (the flattened name — this is what users reference in queries)
+     * - The Java type matches the inner field's type (String.class for String currency,
+     *   long.class for primitive long amount)
+     * - Both appear in `__ALL_PROPERTIES` (used by the query builder to enumerate queryable columns)
+     * - The Property's `name` string argument equals the synthetic name (this is the name JNI
+     *   uses to find the transformer-injected flat field on the entity — if it diverges from
+     *   the field name the transformer injects, reads silently drop data)
+     *
+     * What we DON'T assert:
+     * - Ordinals/IDs (those depend on field declaration order and IdSync — T5 covers stability)
+     * - Full source equivalence (ordinals make that brittle; fragment assertions are sufficient
+     *   and give sharper failure messages)
+     */
+    @Test
+    fun embedded_entityInfo_exposesFlattenedPropertiesAsQueryable() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-entityinfo.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        val compilation = env.compile()
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation.generatedSourceFileOrFail("com.example.Bill_")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // ─── Flattened property constants exist, are Property<Bill>, and have correct types ───
+        // Template pattern per entity-info.ftl:
+        //   public final static io.objectbox.Property<Bill> priceCurrency =
+        //       new io.objectbox.Property<>(__INSTANCE, <ordinal>, <id>, String.class, "priceCurrency");
+        // We fragment-assert around the ordinals (they depend on IdSync/declaration order).
+        src.contains("Property<Bill> priceCurrency =")
+        src.contains("String.class, \"priceCurrency\"")
+        // long amount is a primitive → long.class not Long.class
+        src.contains("Property<Bill> priceAmount =")
+        src.contains("long.class, \"priceAmount\"")
+
+        // ─── Both appear in __ALL_PROPERTIES ───
+        // This is the list the query builder iterates. If a property is missing here, users
+        // can reference Bill_.priceCurrency in code but certain bulk/reflection paths miss it.
+        // Fragment-match within the braces (can't match the whole block — contains id too).
+        src.contains("priceCurrency,")
+        src.contains("priceAmount")  // last element, no trailing comma
+
+        // ─── Negative: the CONTAINER field name must NOT appear as a Property ───
+        // `price` itself is not a DB column — it's a Java-side convenience handle. A Property
+        // named `price` would confuse users ("can I query on the whole Money?").
+        src.doesNotContain("Property<Bill> price =")
+        src.doesNotContain("Property<Bill> price=")
+    }
+
+    /**
      * T9 — `ToOne`/`ToMany` inside an `@Embedded` type → error (R5).
      *
      * Embedded types model **value semantics**: their fields become flat columns on the owner.
@@ -1388,5 +1422,982 @@ class EmbeddedTest : BaseProcessorTest() {
         src.doesNotContain("__emb_price.currency")
     }
 
+    /**
+     * R5 (complete) — `@Id` on an inner field of an embedded type is meaningless: only
+     * `@Entity` classes have an ID column, and the inner field becomes a flat data column
+     * on the OWNING entity (which already has its own `@Id`).
+     *
+     * Today the `@Id` annotation on `Money.cents` is silently ignored — `parseEmbedded()`
+     * never checks for it. The `long cents` field flattens to `priceCents` as a regular Long
+     * column. User thinks they set an ID; they didn't. This test demands an explicit error.
+     */
+    @Test
+    fun embedded_idAnnotationOnInnerField_errors() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Id;
+
+            public class Money {
+                @Id public long cents;   // ← @Id is entity-only; meaningless inside a value object
+                public String currency;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        TestEnvironment("embedded-id-inner.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+            .assertThatIt {
+                failed()
+                hadErrorContaining("@Embedded 'price': @Id on inner field 'cents' is not allowed")
+            }
+    }
+
+    /**
+     * R5 (complete) — `@Index` on an inner field is silently ignored today. User expects
+     * an index on the flattened column; they don't get one. Worse than a loud failure —
+     * queries degrade silently.
+     *
+     * Phase 2 could wire this through (the flattened property IS a real column, indexable
+     * like any other). For now: explicit "not yet supported" error so users aren't misled.
+     */
+    @Test
+    fun embedded_indexAnnotationOnInnerField_errors() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Index;
+
+            public class Money {
+                @Index public String currency;   // ← user expects index on priceCurrency column
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        TestEnvironment("embedded-index-inner.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+            .assertThatIt {
+                failed()
+                hadErrorContaining("@Embedded 'price': @Index on inner field 'currency' is not yet supported")
+                hadErrorContaining("index the flattened property directly in the entity")
+            }
+    }
+
+    /**
+     * R5 (complete) — `@Unique` on inner field: same failure mode as `@Index` (silent ignore →
+     * user assumption violated). Unique constraints on value-object components are occasionally
+     * useful (e.g. "no two Bills can have the same Money.transactionId"), so this too gets
+     * a "not yet supported" message rather than a hard "never" — Phase 2 could wire it.
+     */
+    @Test
+    fun embedded_uniqueAnnotationOnInnerField_errors() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Unique;
+
+            public class Money {
+                public String currency;
+                @Unique public long transactionId;   // ← user wants unique constraint on flattened column
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        TestEnvironment("embedded-unique-inner.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+            .assertThatIt {
+                failed()
+                hadErrorContaining("@Embedded 'price': @Unique on inner field 'transactionId' is not yet supported")
+            }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // P2.2 — @Convert on inner fields of @Embedded types (replaces G2's rejection)
+    //
+    // The downstream machinery composes automatically:
+    //   - cursor.ftl:51 iterates entity.properties; if property.customType set, emits
+    //     `private final <Converter> <propName>Converter = new <Converter>();` — synthetic
+    //     embedded props are in entity.properties → converter field appears for free.
+    //   - PropertyCollector.java:317 calls property.getDatabaseValueExpression(innerAccess)
+    //     which wraps in `<propName>Converter.convertToDatabaseValue(...)` when customType
+    //     is set → write-path wrap is free.
+    //   - Entity.init2ndPass() L482-499 iterates properties, auto-adds converter +
+    //     customType imports if cross-package → imports are free.
+    //
+    // So P2.2 processor work is ONLY: (1) remove G2 @Convert rejection, (2) detect @Convert
+    // on inner field via annotation mirror (Class<?> members can't use getAnnotation()),
+    // (3) derive propertyType from dbType mirror (NOT the inner field's Java type),
+    // (4) set customType/converter on the synthetic property builder.
+    //
+    // Read path (attachEmbedded → copy synthetic transient → container field) is transformer
+    // territory; the transformer needs to convertToEntityProperty() when copying. Noted as
+    // follow-up; processor tests cover write path + model metadata only.
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * `@Convert` on an inner field of an embedded type wires a custom converter to the
+     * flattened synthetic property.
+     *
+     * Model assertions: the synthetic property carries `customType` (Java-side type, e.g.
+     * `java.util.UUID`), `converter` (converter class FQN), and `propertyType` derived
+     * from the annotation's `dbType` (NOT from the inner field's Java type).
+     */
+    @Test
+    fun embedded_convertOnInnerField_setsCustomTypeOnSyntheticProperty() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Convert;
+            import io.objectbox.converter.PropertyConverter;
+
+            public class Money {
+                public String currency;
+                public long amount;
+
+                @Convert(converter = UUIDConverter.class, dbType = String.class)
+                public java.util.UUID txId;   // ← UUID in Java, String in DB
+
+                public Money() {}
+
+                public static class UUIDConverter implements PropertyConverter<java.util.UUID, String> {
+                    @Override public java.util.UUID convertToEntityProperty(String db) {
+                        return db == null ? null : java.util.UUID.fromString(db);
+                    }
+                    @Override public String convertToDatabaseValue(java.util.UUID e) {
+                        return e == null ? null : e.toString();
+                    }
+                }
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        val env = TestEnvironment("embedded-convert.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        env.compile().assertThatIt { succeededWithoutWarnings() }
+
+        val billEntity = env.schema.entities.single { it.className == "Bill" }
+        val txIdProp = billEntity.properties.single { it.propertyName == "priceTxId" }
+
+        // PropertyType derived from @Convert.dbType (String), not from the UUID field type.
+        // This is what determines the DB column type and native collect signature.
+        assertType(txIdProp, PropertyType.String, hasNonPrimitiveFlag = true)
+
+        // customType = the Java-side type (what users see in their entity object).
+        // cursor.ftl checks property.customType?has_content to decide whether to emit
+        // a converter instance field → this MUST be set for the whole chain to fire.
+        assertThat(txIdProp.customType).isEqualTo("java.util.UUID")
+
+        // converter = FQN of the PropertyConverter implementation. cursor.ftl uses
+        // converterClassName (derived from this) for `new <Converter>()` instantiation.
+        assertThat(txIdProp.converter).isEqualTo("com.example.Money.UUIDConverter")
+
+        // Still flagged as embedded — converter wrapping composes WITH the container-path
+        // read, not instead of it. PropertyCollector routes isEmbedded() → container path,
+        // then getDatabaseValueExpression() applies the converter wrap to that path.
+        assertThat(txIdProp.isEmbedded).isTrue()
+        assertThat(txIdProp.embeddedOrigin?.name).isEqualTo("price")
+
+        // Control: non-@Convert inner fields unaffected (no spurious customType set).
+        val currencyProp = billEntity.properties.single { it.propertyName == "priceCurrency" }
+        assertThat(currencyProp.customType).isNull()
+    }
+
+    /**
+     * Codegen end of P2.2: the generated Cursor must (1) instantiate the converter as a
+     * private final field, and (2) wrap the container-path read in a `convertToDatabaseValue()`
+     * call. Both happen automatically once `customType`/`converter` are set on the synthetic
+     * property — this test pins that the composition doesn't silently break.
+     *
+     * The golden fragment to look for:
+     *   `priceTxIdConverter.convertToDatabaseValue(__emb_price.txId)`
+     * Proves converter wrap (`priceTxIdConverter.convert…`) composes with container-path
+     * read (`__emb_price.txId`) — neither stomps the other.
+     */
+    @Test
+    fun embedded_convertOnInnerField_cursorWrapsContainerPathReadInConverter() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Convert;
+            import io.objectbox.converter.PropertyConverter;
+
+            public class Money {
+                public String currency;
+
+                @Convert(converter = UUIDConverter.class, dbType = String.class)
+                public java.util.UUID txId;
+
+                public Money() {}
+
+                public static class UUIDConverter implements PropertyConverter<java.util.UUID, String> {
+                    @Override public java.util.UUID convertToEntityProperty(String db) { return db == null ? null : java.util.UUID.fromString(db); }
+                    @Override public String convertToDatabaseValue(java.util.UUID e) { return e == null ? null : e.toString(); }
+                }
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        val compilation = TestEnvironment("embedded-convert-codegen.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation
+            .generatedSourceFileOrFail("com.example.BillCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // ─── Converter instance field — emitted by cursor.ftl:51 when customType set ───
+        // `private final <ConverterClass> <syntheticName>Converter = new <ConverterClass>();`
+        // Note the synthetic property name `priceTxId` (not `txId`) in the field name.
+        // Template uses the simple class name (init2ndPass() adds the import); Entity's
+        // import-auto-add loop iterates ALL properties including synthetic embedded ones.
+        src.contains("import com.example.Money.UUIDConverter;")
+        src.contains("private final UUIDConverter priceTxIdConverter = new UUIDConverter();")
+
+        // ─── Container hoist (unchanged by @Convert presence) ───
+        src.contains("Money __emb_price = entity.price;")
+
+        // ─── The crux: converter wrap COMPOSES with container-path read ───
+        // getDatabaseValueExpression(innerAccess) → <syntheticName>Converter.convertToDatabaseValue(<innerAccess>)
+        // where innerAccess = __emb_price.txId. This single fragment proves the whole chain.
+        src.contains("priceTxIdConverter.convertToDatabaseValue(__emb_price.txId)")
+
+        // ─── Negative: must NOT read `entity.priceTxId` (the synthetic name) directly ───
+        // That would be the non-embedded write path. We must route through the container.
+        src.doesNotContain("entity.priceTxId")
+        // And must NOT call the converter on the raw UUID without container-path routing.
+        src.doesNotContain("convertToDatabaseValue(entity.")
+    }
+
     // endregion M5
+
+    // region P2 — Phase 2 hardening features
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //
+    // P2.3 — @Embedded on a @BaseEntity field is inherited by concrete @Entity subclasses.
+    //
+    // Mechanism: ObjectBoxProcessor.parseProperties() walks the inheritance chain
+    // (super-most-first), creating one Properties instance per element with a SHARED
+    // entityModel — so synthetic properties added while visiting the @BaseEntity land on
+    // the concrete @Entity's model. The only thing stopping @Embedded from riding this
+    // existing mechanism is a checkNotSuperEntity() call in the dispatch branch — a
+    // copy-paste from the ToOne/ToMany branches, where the check IS needed (relations
+    // need __boxStore injection on the concrete type). @Embedded has no such requirement:
+    // the container field is just inherited Java data.
+    //
+    // What we prove below:
+    //   T-P2.3a — model: flattened props appear in subclass schema, embedded metadata set
+    //   T-P2.3b — codegen: subclass Cursor hoists inherited container, reads inner fields
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * An `@Embedded` field declared on a `@BaseEntity` class must flatten into the
+     * concrete `@Entity` subclass's property set — exactly as if it were declared
+     * directly on the subclass.
+     *
+     * Before this fix, `parseField()` rejected `@Embedded` when `isSuperEntity == true`
+     * with the misleading message "A super class of an @Entity must not have a relation"
+     * (it's not a relation). The inheritance field-walk mechanism itself needed no
+     * changes — this is purely a dispatch-branch gate removal.
+     */
+    @Test
+    fun embedded_onBaseEntity_flattensIntoSubclassModel() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val baseBill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.BaseEntity;
+            import io.objectbox.annotation.Embedded;
+            import io.objectbox.annotation.Id;
+
+            @BaseEntity
+            public abstract class BaseBill {
+                @Id public long id;
+                @Embedded public Money price;   // ← declared on @BaseEntity
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+
+            @Entity
+            public class Bill extends BaseBill {
+                public String provider;   // ← subclass-local prop to verify ordering doesn't matter
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-baseentity.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.BaseBill", baseBill)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        env.compile().assertThatIt { succeededWithoutWarnings() }
+
+        // ─── Model assertions: synthetic properties appear on the CONCRETE entity ───
+        val schema = env.schema
+        val billEntity = schema.entities.single { it.className == "Bill" }
+
+        // All four expected props: id (inherited), provider (local), two synthetic (inherited embedded)
+        val propNames = billEntity.properties.map { it.propertyName }.toSet()
+        assertThat(propNames).containsExactly("id", "provider", "priceCurrency", "priceAmount")
+
+        // Synthetic props carry embedded-origin metadata → M2/M3 codegen routes correctly
+        val priceCurrency = billEntity.properties.single { it.propertyName == "priceCurrency" }
+        assertThat(priceCurrency.isEmbedded).isTrue()
+        assertThat(priceCurrency.embeddedOrigin?.name).isEqualTo("price")
+
+        val priceAmount = billEntity.properties.single { it.propertyName == "priceAmount" }
+        assertThat(priceAmount.isEmbedded).isTrue()
+        assertPrimitiveType(priceAmount, PropertyType.Long)
+
+        // Container NOT a property on the entity (it's an EmbeddedField, not a Property)
+        assertThat(billEntity.properties.none { it.propertyName == "price" }).isTrue()
+        assertThat(billEntity.hasEmbedded()).isTrue()
+    }
+
+    /**
+     * Codegen end of P2.3: the generated `BillCursor.put()` must hoist the inherited
+     * container field (`entity.price` — inherited from `BaseBill`) and read its inner
+     * fields with the same null-guard pattern as a directly-declared `@Embedded`.
+     *
+     * Java inheritance makes `entity.price` visible on the subclass without any codegen
+     * special-casing — the Cursor is generated against `Bill`, and `price` is an inherited
+     * public field. This test pins that no special-casing CREEPS IN either.
+     */
+    @Test
+    fun embedded_onBaseEntity_subclassCursorHoistsInheritedContainer() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val baseBill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.BaseEntity;
+            import io.objectbox.annotation.Embedded;
+            import io.objectbox.annotation.Id;
+
+            @BaseEntity
+            public abstract class BaseBill {
+                @Id public long id;
+                @Embedded public Money price;
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+
+            @Entity
+            public class Bill extends BaseBill {
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-baseentity-codegen.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.BaseBill", baseBill)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        val compilation = env.compile()
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        // contentsAsString() returns a Truth StringSubject — .contains() is the assertion
+        val cursorSrc = compilation
+            .generatedSourceFileOrFail("com.example.BillCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // Hoist the inherited container — no special-casing needed, `entity.price` inherits
+        cursorSrc.contains("Money __emb_price = entity.price;")
+        // Inner reads with null-guard (same pattern as direct @Embedded)
+        cursorSrc.contains("__emb_price != null")
+        cursorSrc.contains("__emb_price.currency")
+        cursorSrc.contains("__emb_price.amount")
+        // attachEmbedded override present — concrete entity hasEmbedded() → true via inherited field
+        cursorSrc.contains("public void attachEmbedded(Bill entity)")
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // P2.1 — @NameInDb / @Uid passthrough on inner fields
+    //
+    // Both annotations modulate the FLATTENED property, not the container:
+    //   @NameInDb("cur") on Money.currency → synthetic property's DB column is "cur",
+    //     NOT "priceCurrency". Property NAME (Java-side static field in Bill_) stays
+    //     "priceCurrency"; only the dbName changes. This matches @NameInDb semantics
+    //     elsewhere: explicit column-name override, verbatim.
+    //   @Uid(N) on Money.currency → the synthetic property "priceCurrency" gets UID N.
+    //     Lets users pin a flattened column's identity across schema migrations (e.g.
+    //     rename Money.currency → Money.isoCode without losing the column).
+    //
+    // Design trade-off: same Money type embedded twice with @NameInDb/@Uid on an inner
+    // field → collision (two columns want the same name/UID). We honor the user's literal
+    // intent; trackUniqueName()/IdSync catch the collision with a clear error. The
+    // alternative (silently prefixing @NameInDb values) would be surprising: user writes
+    // "cur", gets "priceCur". What-you-write-is-what-you-get wins.
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * `@NameInDb("cur")` on an inner field overrides the DB column name for the
+     * flattened synthetic property. The Java-side property name (for `Bill_.priceCurrency`)
+     * stays derived — only `dbName` changes.
+     *
+     * Before this fix, `@NameInDb` on an inner field was silently ignored by the R5
+     * rejection (G2) — this test replaces the rejection with passthrough.
+     */
+    @Test
+    fun embedded_nameInDbOnInnerField_overridesDbColumnName() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.NameInDb;
+
+            public class Money {
+                @NameInDb("cur") public String currency;  // ← column named "cur", not "priceCurrency"
+                public long amount;                        // ← no override; column = "priceAmount" (default)
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        val env = TestEnvironment("embedded-nameindb.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        env.compile().assertThatIt { succeededWithoutWarnings() }
+
+        val billEntity = env.schema.entities.single { it.className == "Bill" }
+
+        // Property NAME (Java-side) unchanged — still the derived synthetic name.
+        // This is what appears as `Bill_.priceCurrency` in generated EntityInfo_.
+        val currencyProp = billEntity.properties.single { it.propertyName == "priceCurrency" }
+        // DB column name overridden — this is what model.json's "name" field becomes.
+        assertThat(currencyProp.dbName).isEqualTo("cur")
+
+        // Control: the non-annotated inner field keeps the derived-from-synthetic default.
+        val amountProp = billEntity.properties.single { it.propertyName == "priceAmount" }
+        assertThat(amountProp.dbName).isEqualTo("priceAmount")
+
+        // Cross-check model.json — the serialized "name" IS the dbName, so "cur" must appear
+        // and "priceCurrency" must NOT (it's only a Java-side identifier).
+        val model = env.readModel()
+        val modelEntity = model.findEntity("Bill", null)!!
+        assertThat(modelEntity.properties.map { it.name }).containsExactly("id", "cur", "priceAmount")
+    }
+
+    /**
+     * `@Uid(N)` on an inner field pins the synthetic property's UID in the model.
+     *
+     * Use case: user renames `Money.currency` → `Money.isoCode`. Without a pinned UID,
+     * IdSync sees `priceCurrency` disappear and `priceIsoCode` appear → treats as
+     * drop + add → data loss. With `@Uid` pinning the original UID, the column identity
+     * survives: IdSync matches by UID, sees "same column, new name", no data loss.
+     *
+     * ## Test structure — two-compile, self-contained
+     * ObjectBox's @Uid contract: you can't write an arbitrary UID (IdSync rejects values
+     * not already in the model or newUidPool — "Unexpected UID N was not in newUidPool").
+     * The real workflow is: (1) build without @Uid, (2) read assigned UID from model.json,
+     * (3) write @Uid(<that value>) to pin it. We mirror that here WITHOUT committing a
+     * fixture with baked-in random UIDs (cf. uid.json — fragile, git-noisy).
+     *
+     * Compile #1: no annotation → capture the UID IdSync assigns to `priceCurrency`.
+     * Compile #2: @Uid(<captured>) on Money.currency, AND rename the inner field to
+     *             `isoCode` — if passthrough works, the column keeps the same UID despite
+     *             the synthetic name changing from `priceCurrency` → `priceIsoCode`.
+     *
+     * This proves the full chain: annotation read from inner field → modelId set on synthetic
+     * property → IdSync accepts existing UID → column identity survives rename.
+     */
+    @Test
+    fun embedded_uidOnInnerField_pinsUidOnSyntheticProperty() {
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        // ─── Compile #1 — establish a model with known UID for priceCurrency ───
+        @Language("Java")
+        val moneyV1 =
+            """
+            package com.example;
+
+            public class Money {
+                public String currency;
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        val env1 = TestEnvironment("embedded-uid.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", moneyV1)
+                addSourceFile("com.example.Bill", bill)
+            }
+        env1.compile().assertThatIt { succeededWithoutWarnings() }
+
+        // Capture the UID IdSync assigned + the raw model JSON (we'll feed this back in).
+        val model1 = env1.readModel()
+        val originalUid = model1.findEntity("Bill", null)!!
+            .properties.single { it.name == "priceCurrency" }.uid
+        assertThat(originalUid).isNotEqualTo(0L)
+
+        val modelsDir = when {
+            File("src/test/resources/objectbox-models/").isDirectory ->
+                "src/test/resources/objectbox-models/"
+            else -> "objectbox-processor/src/test/resources/objectbox-models/"
+        }
+        val modelFile = File("${modelsDir}embedded-uid.json.tmp")
+        val model1Json = modelFile.readText()
+
+        // ─── Compile #2 — rename inner field, pin original UID via @Uid on inner field ───
+        // The inner-field rename changes the synthetic name (priceCurrency → priceIsoCode).
+        // Without @Uid, IdSync would retire priceCurrency and create priceIsoCode (new UID).
+        // With @Uid on the RENAMED inner field, IdSync must recognise "same column, new name".
+        @Language("Java")
+        val moneyV2 =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Uid;
+
+            public class Money {
+                @Uid(${originalUid}L) public String isoCode;   // ← renamed from 'currency'
+                public long amount;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        val env2 = TestEnvironment("embedded-uid.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", moneyV2)
+                addSourceFile("com.example.Bill", bill)
+            }
+        // env2's init deleted the .tmp — restore the compile #1 model so IdSync has
+        // context (it needs to SEE the old priceCurrency column to recognise the UID).
+        modelFile.writeText(model1Json)
+
+        env2.compile().assertThatIt { succeededWithoutWarnings() }
+
+        // ─── Core assertion: the renamed synthetic property kept the original UID ───
+        val schemaEntity = env2.schema.entities.single { it.className == "Bill" }
+        // New synthetic name (derived from renamed inner field)
+        val renamedProp = schemaEntity.properties.single { it.propertyName == "priceIsoCode" }
+        // Same UID as before the rename — proves @Uid on the inner field was honoured.
+        assertThat(renamedProp.modelId.uid).isEqualTo(originalUid)
+
+        // Cross-check model.json: priceCurrency gone, priceIsoCode present with original UID.
+        val model2 = env2.readModel()
+        val bill2 = model2.findEntity("Bill", null)!!
+        assertThat(bill2.properties.map { it.name }).doesNotContain("priceCurrency")
+        val isoInModel = bill2.properties.single { it.name == "priceIsoCode" }
+        assertThat(isoInModel.uid).isEqualTo(originalUid)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // P2.4 — Nested @Embedded (lift R6)
+    //
+    // Recursive flattening: `Bill { @Embedded Money price }; Money { long amount;
+    // @Embedded Currency cur }; Currency { String code; int scale }` produces four
+    // leaf columns on Bill: priceAmount, priceCurCode, priceCurScale + id.
+    //
+    // Key invariant: each LEAF property's embeddedOrigin points to the INNERMOST
+    // container (the EmbeddedField for `cur`, not `price`). That container's
+    // localVarName encodes the full path (`__emb_price_cur`) so PropertyCollector's
+    // existing per-property logic (`<localVar> != null ? ...` and `<localVar>.<leaf>`)
+    // works UNCHANGED. Only the hoist loop needs to chain: nested containers hoist
+    // from their PARENT's local var with null-propagation, not from `entity.` directly.
+    //
+    //   Money    __emb_price     = entity.price;                                       ← root
+    //   Currency __emb_price_cur = __emb_price != null ? __emb_price.cur : null;       ← nested
+    //   // then leaf reads:
+    //   __emb_price_cur != null ? __ID_priceCurCode : 0
+    //   __emb_price_cur.code
+    //
+    // Compound prefix: `outer.syntheticNameFor(inner.resolvedPrefix)` applied
+    // transitively. So `price + capFirst(cur) = priceCur`, then `priceCur + Code`.
+    // Empty-prefix cases compose naturally (see syntheticNameFor()'s empty-prefix
+    // short-circuit).
+    //
+    // Cycle detection: walk tracks visited type FQNs; re-visiting the same type in
+    // the chain → explicit error (not a stack overflow).
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Two-level `@Embedded`: `Bill { @Embedded Money price }; Money { long amount;
+     * @Embedded Currency cur }; Currency { String code; int scale }`.
+     *
+     * Model assertions: four synthetic props on Bill with compound-prefixed names,
+     * each leaf property pointing to its INNERMOST container as origin.
+     */
+    @Test
+    fun embedded_nested_compoundPrefixFlattening() {
+        @Language("Java")
+        val currency =
+            """
+            package com.example;
+
+            public class Currency {
+                public String code;
+                public int scale;
+                public Currency() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Embedded;
+
+            public class Money {
+                public long amount;
+                @Embedded public Currency cur;   // ← nested embed; default prefix = "cur"
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        val env = TestEnvironment("embedded-nested.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Currency", currency)
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+
+        env.compile().assertThatIt { succeededWithoutWarnings() }
+
+        val billEntity = env.schema.entities.single { it.className == "Bill" }
+        val propNames = billEntity.properties.map { it.propertyName }.toSet()
+
+        // Four expected leaves: one direct from Money, two from nested Currency.
+        // Compound prefix for nested: price + Cur = priceCur → priceCurCode, priceCurScale.
+        assertThat(propNames).containsExactly("id", "priceAmount", "priceCurCode", "priceCurScale")
+
+        // Leaf properties point to their INNERMOST container ("cur"), not the root ("price").
+        // This is what makes PropertyCollector's existing leaf-read logic work: the leaf's
+        // embeddedOrigin.localVarName is `__emb_price_cur`, so `<localVar>.code` → correct.
+        val codeProp = billEntity.properties.single { it.propertyName == "priceCurCode" }
+        assertThat(codeProp.isEmbedded).isTrue()
+        assertThat(codeProp.embeddedOrigin?.name).isEqualTo("cur")
+        assertType(codeProp, PropertyType.String)
+
+        // Direct leaf from the OUTER container still points to "price" (unchanged).
+        val amountProp = billEntity.properties.single { it.propertyName == "priceAmount" }
+        assertThat(amountProp.embeddedOrigin?.name).isEqualTo("price")
+
+        // Entity tracks TWO EmbeddedFields — root and nested — for hoisting and imports.
+        // Order matters for the hoist chain (parent declared before child references it).
+        assertThat(billEntity.hasEmbedded()).isTrue()
+        val embFields = billEntity.embeddedFields
+        assertThat(embFields.map { it.name }).containsExactly("price", "cur").inOrder()
+    }
+
+    /**
+     * Codegen end of P2.4: the generated Cursor's `put()` must emit a CHAINED hoist
+     * (nested container hoisted from parent's local var with null-propagation) and
+     * route leaf reads through the deepest-level local.
+     *
+     * The hoist chain proves null-propagation: if `entity.price` is null,
+     * `__emb_price_cur` ALSO becomes null (via the ternary), so the leaf null-guard
+     * `__emb_price_cur != null ? ...` correctly skips ALL nested-leaf columns.
+     * Without this chaining, a null outer container with a non-null default nested
+     * container would write garbage.
+     */
+    @Test
+    fun embedded_nested_cursorEmitsChainedHoistWithNullPropagation() {
+        @Language("Java")
+        val currency =
+            """
+            package com.example;
+
+            public class Currency {
+                public String code;
+                public int scale;
+                public Currency() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Embedded;
+
+            public class Money {
+                public long amount;
+                @Embedded public Currency cur;
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        val compilation = TestEnvironment("embedded-nested-codegen.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Currency", currency)
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+
+        compilation.assertThatIt { succeededWithoutWarnings() }
+
+        val src = compilation
+            .generatedSourceFileOrFail("com.example.BillCursor")
+            .contentsAsString(StandardCharsets.UTF_8)
+
+        // ─── Root hoist — unchanged ───
+        src.contains("Money __emb_price = entity.price;")
+
+        // ─── Nested hoist — THE CRUX. Chains from parent's local with null-propagation. ───
+        // NOT `entity.cur` (there's no such field on Bill).
+        // NOT `__emb_price.cur` unguarded (would NPE if price is null).
+        // The ternary ensures null propagates all the way down: null outer → null nested → skip all leaves.
+        src.contains("Currency __emb_price_cur = __emb_price != null ? __emb_price.cur : null;")
+
+        // ─── Leaf reads route through the DEEPEST local (NOT the root one) ───
+        // PropertyCollector's existing embedded branch uses `<origin.localVarName>.<sourceValueExpr>`.
+        // Since the leaf's origin is the `cur` EmbeddedField with localVarName `__emb_price_cur`,
+        // this composes without PropertyCollector changes to the per-property logic.
+        src.contains("__emb_price_cur != null")
+        src.contains("__emb_price_cur.code")
+        src.contains("__emb_price_cur.scale")
+
+        // ─── Direct leaf from the outer container still uses the outer local ───
+        src.contains("__emb_price.amount")
+
+        // ─── Negatives: bad patterns that would indicate broken routing ───
+        src.doesNotContain("entity.cur")         // ← nested container isn't on the entity
+        src.doesNotContain("entity.price.cur")   // ← would bypass null-guard
+        src.doesNotContain("__emb_cur ")         // ← would collide if two containers share inner name
+    }
+
+    /**
+     * Cycle detection: `Money { @Embedded Money sub }` — a type embedding itself
+     * (directly or transitively) must be rejected with an explicit cycle error,
+     * NOT a stack overflow or an infinite-loop compiler hang.
+     *
+     * Cycles can arise naturally when refactoring entity hierarchies into value objects;
+     * the user deserves a clear message with the type chain that forms the loop.
+     */
+    @Test
+    fun embedded_nested_cycleDetection_errors() {
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Embedded;
+
+            public class Money {
+                public long amount;
+                @Embedded public Money sub;   // ← direct self-reference
+                public Money() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val bill = embeddedBillOwning("Money", "price")
+
+        TestEnvironment("embedded-nested-cycle.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+            .compile()
+            .assertThatIt {
+                failed()
+                // Must name the type AND say "cycle" — "nested @Embedded not supported" would
+                // mislead (nesting IS supported now; the problem is specifically the cycle).
+                hadErrorContaining("cycle")
+                hadErrorContaining("Money")
+            }
+    }
+
+    /**
+     * A NESTED container's simple name must NOT leak into the owning entity's
+     * unique-name set — `Money.cur` is a field on `Money`, not on `Bill`, so a user's
+     * own `Bill.cur` field (a plain String property with nothing to do with the nesting)
+     * must not false-collide.
+     *
+     * The root container's name IS reserved (that's the point — `@Embedded Money price`
+     * colliding with `String price` on the same entity SHOULD fail). But the nested
+     * container lives one level down; its name only has meaning inside `Money`'s scope.
+     *
+     * This test also sanity-checks that the user's `cur` stays a normal non-embedded
+     * property and the nested flattening still happens correctly alongside it.
+     */
+    @Test
+    fun embedded_nested_containerNameDoesNotLeakIntoEntityNameset() {
+        @Language("Java")
+        val currency =
+            """
+            package com.example;
+
+            public class Currency {
+                public String code;
+                public Currency() {}
+            }
+            """.trimIndent()
+
+        @Language("Java")
+        val money =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Embedded;
+
+            public class Money {
+                public long amount;
+                @Embedded public Currency cur;   // ← nested container NAMED 'cur'
+                public Money() {}
+            }
+            """.trimIndent()
+
+        // Bill ALSO has a direct property named 'cur' — would collide with the nested
+        // container's name IF addEmbedded() wrongly reserves nested names at entity scope.
+        @Language("Java")
+        val bill =
+            """
+            package com.example;
+
+            import io.objectbox.annotation.Entity;
+            import io.objectbox.annotation.Id;
+            import io.objectbox.annotation.Embedded;
+
+            @Entity
+            public class Bill {
+                @Id public long id;
+                @Embedded public Money price;
+                public String cur;   // ← plain prop; same simple name as nested container
+            }
+            """.trimIndent()
+
+        val env = TestEnvironment("embedded-nested-nameleak.json", useTemporaryModelFile = true)
+            .apply {
+                addSourceFile("com.example.Currency", currency)
+                addSourceFile("com.example.Money", money)
+                addSourceFile("com.example.Bill", bill)
+            }
+        env.compile().assertThatIt { succeededWithoutWarnings() }
+
+        val billEntity = env.schema.entities.single { it.className == "Bill" }
+        val propNames = billEntity.properties.map { it.propertyName }.toSet()
+        // Both the user's direct `cur` AND the nested flattened `priceCurCode` coexist.
+        assertThat(propNames).containsExactly("id", "priceAmount", "priceCurCode", "cur")
+
+        // User's `cur` is a plain (non-embedded) property.
+        val userCur = billEntity.properties.single { it.propertyName == "cur" }
+        assertThat(userCur.isEmbedded).isFalse()
+
+        // Nested flattening unaffected — leaf still routes through innermost container.
+        val nestedLeaf = billEntity.properties.single { it.propertyName == "priceCurCode" }
+        assertThat(nestedLeaf.isEmbedded).isTrue()
+        assertThat(nestedLeaf.embeddedOrigin?.name).isEqualTo("cur")
+    }
+
+    // endregion P2
+
+    // ─── Helper: minimal entity that owns an @Embedded field of the given type ───
+    // Cuts boilerplate for negative tests where only the embedded type varies.
+    @Language("Java")
+    private fun embeddedBillOwning(embeddedType: String, fieldName: String): String =
+        """
+        package com.example;
+
+        import io.objectbox.annotation.Entity;
+        import io.objectbox.annotation.Id;
+        import io.objectbox.annotation.Embedded;
+
+        @Entity
+        public class Bill {
+            @Id public long id;
+            @Embedded public $embeddedType $fieldName;
+        }
+        """.trimIndent()
 }

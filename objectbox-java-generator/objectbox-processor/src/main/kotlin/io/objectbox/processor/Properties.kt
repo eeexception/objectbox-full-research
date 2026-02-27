@@ -135,8 +135,12 @@ class Properties(
             checkNoIndexOrUniqueAnnotation(field, "ToMany")
             relations.parseToMany(entityModel, field)
         } else if (field.hasAnnotation(Embedded::class.java)) {
-            // @Embedded container field — flatten inner fields into synthetic properties
-            checkNotSuperEntity(field)
+            // @Embedded container field — flatten inner fields into synthetic properties.
+            // Note: unlike ToOne/ToMany above, NO checkNotSuperEntity — @Embedded on a
+            // @BaseEntity works via plain Java inheritance (the container field is inherited
+            // data, needs no __boxStore injection on the concrete type). The shared entityModel
+            // means synthetic props land on the concrete @Entity regardless of where in the
+            // chain the @Embedded is declared.
             checkNoIndexOrUniqueAnnotation(field, "@Embedded")
             parseEmbedded(field)
         } else {
@@ -177,14 +181,50 @@ class Properties(
      *   loudly rather than silently reading garbage.
      * - Synthetic properties are **NOT** marked virtual. The transformer-injected field IS real;
      *   JNI must set it directly by `Property.name` during reads.
+     *
+     * ### Nested `@Embedded` (P2.4)
+     * When an inner field is itself `@Embedded`, this method **recurses** with
+     * `parentEmbedded` set. The child's prefix is compounded through the parent's
+     * [EmbeddedField.syntheticNameFor] (e.g. parent `price` + child `cur` → `priceCur`,
+     * so leaf `code` → `priceCurCode`). The child [EmbeddedField] carries a `parent` ref
+     * so codegen can emit a **chained hoist** (`__emb_price_cur = __emb_price != null ?
+     * __emb_price.cur : null`) — see [EmbeddedField.hoistRhsExpression]. All nested
+     * [EmbeddedField]s go into the entity's flat list in depth-first order (parent
+     * registered BEFORE inner-field walk → guaranteed before any nested child), which
+     * is what PropertyCollector's hoist loop depends on (each nested hoist reads the
+     * parent's local, which must already be declared).
+     *
+     * Cycle detection uses a per-recursion-path set of visited type FQNs: a type embedding
+     * itself (directly or transitively) produces infinite recursion and infinite columns;
+     * we catch it at the first revisit with a clear error naming the cycle edge.
+     *
+     * @param field the `@Embedded`-annotated [VariableElement]
+     * @param parentEmbedded `null` at the top level (called from [parseField]); set to
+     *   the enclosing container when recursing into a nested `@Embedded`.
+     * @param visitedTypes FQNs of types already on the current recursion path (NOT a
+     *   global cache — two sibling embeds of the same type are fine; only a PATH cycle
+     *   is an error). A fresh set is passed at each recurse with the current type added.
+     * @return count of LEAF synthetic properties produced (including transitive leaves
+     *   from nested embeds); `-1` if any error was reported (error already emitted,
+     *   caller should abort). The top-level call from [parseField] ignores the return.
      */
-    private fun parseEmbedded(field: VariableElement) {
+    private fun parseEmbedded(
+        field: VariableElement,
+        parentEmbedded: EmbeddedField? = null,
+        visitedTypes: Set<String> = emptySet()
+    ): Int {
         val annotation = field.getAnnotation(Embedded::class.java)
         val fieldName = field.simpleName.toString()
 
         // ─── Resolve prefix: sentinel → field name; explicit "" → no prefix; else → as given ───
+        // For nested embeds, compound through the parent: the parent's prefix becomes
+        // part of OURS so that syntheticNameFor() on a leaf produces the fully-qualified
+        // flat name (priceCurCode, not curCode). syntheticNameFor's empty-prefix
+        // short-circuit makes this compose correctly for all four empty/non-empty combos
+        // (e.g. outer "" + inner "cur" → just "cur"; outer "price" + inner "" → "price").
         val rawPrefix = annotation.prefix
-        val effectivePrefix = if (rawPrefix == Embedded.USE_FIELD_NAME) fieldName else rawPrefix
+        val localPrefix = if (rawPrefix == Embedded.USE_FIELD_NAME) fieldName else rawPrefix
+        val effectivePrefix = parentEmbedded?.syntheticNameFor(localPrefix) ?: localPrefix
 
         // ─── Resolve embedded type element to walk its fields ───
         val fieldType = field.asType()
@@ -194,7 +234,7 @@ class Properties(
                 "@Embedded field '$fieldName' must be a declared class type, got $fieldType.",
                 field
             )
-            return
+            return -1
         }
         val typeElement = fieldType.asElement() as? TypeElement
         if (typeElement == null) {
@@ -202,34 +242,57 @@ class Properties(
                 "@Embedded field '$fieldName' type could not be resolved to a class element.",
                 field
             )
-            return
+            return -1
         }
         val typeFqn = typeElement.qualifiedName.toString()
         val typeSimple = typeElement.simpleName.toString()
 
+        // ─── P2.4 cycle check — BEFORE validateEmbeddedType (cheaper, and the cycle ───
+        // message is more actionable than a validation failure that happens to be
+        // transitively caused by a cycle). Compared against FQN so distinct types
+        // with the same simple name don't false-positive; and we check against the
+        // PATH set (not a global "seen types") so two sibling @Embedded Money
+        // fields in the same entity are fine — only Money embedding Money is a cycle.
+        if (typeFqn in visitedTypes) {
+            messages.error(
+                "@Embedded cycle detected: '$typeSimple' ($typeFqn) embeds itself " +
+                        "(directly or transitively) via field '$fieldName'. " +
+                        "Break the cycle by removing @Embedded at one level.",
+                field
+            )
+            return -1
+        }
+
         // ─── M1.3 type-level validation — reject before polluting the entity model ───
         if (!validateEmbeddedType(fieldName, typeElement, typeSimple, field)) {
-            return
+            return -1
         }
 
         // ─── Create and register the container model BEFORE synthesizing properties ───
         // Registering first reserves the container name in the entity's unique-name set,
         // so a subsequent synthetic prop with the same name (e.g. prefix="" + inner field
         // name == container name) fails fast via trackUniqueName().
+        //
+        // For nested embeds, registering here (before the recursive walk) ALSO guarantees
+        // the flat entity.embeddedFields list is in depth-first parent-before-child order,
+        // which PropertyCollector's hoist loop REQUIRES (a nested hoist reads from its
+        // parent's local var — that local must already be declared by the time the nested
+        // hoist emits its own declaration line).
         val isContainerFieldAccessible = !field.modifiers.contains(Modifier.PRIVATE)
         val embedded = EmbeddedField(
             name = fieldName,
             isFieldAccessible = isContainerFieldAccessible,
             prefix = effectivePrefix,
             typeFullyQualifiedName = typeFqn,
-            typeSimpleName = typeSimple
+            typeSimpleName = typeSimple,
+            parent = parentEmbedded
         )
         embedded.setParsedElement(field)
         try {
             entityModel.addEmbedded(embedded)
         } catch (e: ModelException) {
             messages.error("Could not add @Embedded container: ${e.message}", field)
-            return
+            return -1
         }
 
         // ─── Walk inner fields, applying the same skip rules as parseField() ───
@@ -246,25 +309,77 @@ class Properties(
 
             val innerFieldName = innerField.simpleName.toString()
 
-            // ─── M1.3: Nested @Embedded — explicit rejection BEFORE type resolution ───
-            // Without this check, the inner @Embedded annotation is silently ignored and the
-            // user gets the generic "unsupported type" error below (getPropertyType returns
-            // null for the nested POJO). That message gives no hint that NESTING is the issue;
-            // users might think they need @Convert. This check intercepts with a clear message.
+            // ─── P2.4: Nested @Embedded — recurse with compound prefix + cycle tracking ───
+            // The recursive call handles ALL of: prefix compounding, cycle detection,
+            // type validation, and registration of the nested EmbeddedField (with
+            // parent=embedded) on the entity's flat list. Leaf properties synthesised
+            // downstream of the recursion get their embeddedOrigin set to the INNERMOST
+            // container (the recursive call's own `embedded` local), which is exactly
+            // what PropertyCollector needs — the per-property guard/deref uses the
+            // origin's localVarName, and for nested that's the path-qualified
+            // `__emb_price_cur` (not the outer `__emb_price`).
             //
-            // Single-level @Embedded only in M1 — recursive flattening would need multi-segment
-            // container paths (entity.price.cur.code), compound null-guards, and cycle detection.
-            // Deferred as YAGNI until a concrete use case demands it.
+            // We pass a FRESH set (visitedTypes + typeFqn) rather than mutating — two
+            // sibling nested embeds at the same level should each see the same parent
+            // path, not whatever the first sibling's traversal added/removed. Copy
+            // cost is negligible for realistic nesting depths (1-3).
+            //
+            // Transitive leaf count rolls up so the "no persistable fields" check below
+            // recognises a container whose ONLY field is another @Embedded (which in
+            // turn has real fields) as valid — it produced no direct leaves but it DID
+            // contribute properties to the entity.
             if (innerField.hasAnnotation(Embedded::class.java)) {
-                messages.error(
-                    "@Embedded '$fieldName': nested @Embedded on inner field '$innerFieldName' " +
-                            "is not supported. Flatten '$typeSimple' manually or remove @Embedded " +
-                            "from '$typeSimple.$innerFieldName'.",
-                    innerField
+                val nestedCount = parseEmbedded(
+                    innerField,
+                    parentEmbedded = embedded,
+                    visitedTypes = visitedTypes + typeFqn
                 )
-                return
+                if (nestedCount < 0) return -1 // error already emitted; propagate abort
+                producedCount += nestedCount
+                continue
             }
 
+            // ─── R5 (complete): ObjectBox property-config annotations on inner fields ───
+            // Today these are silently ignored — parseEmbedded() only reads the inner field's
+            // TYPE and NAME, never its annotations beyond @Transient/@Embedded. That silent-ignore
+            // is the worst possible behaviour: users slap @Index on an inner field, compilation
+            // succeeds, and queries degrade silently because the index was never created.
+            //
+            // Phase 2 (P2.1 @NameInDb/@Uid, P2.2 @Convert) will wire SOME of these through —
+            // the flattened property IS a real column and e.g. @Index on it is perfectly
+            // meaningful. @Id never makes sense inside a value object (only @Entity has an ID
+            // column). Until then: explicit rejection with the workaround spelled out, so users
+            // know exactly what to do.
+            //
+            // Batched as four sequential checks rather than a single combined predicate:
+            // each annotation has a DIFFERENT fix hint, and the error should name the specific
+            // annotation the user wrote. @Id gets "not allowed" (permanent); the rest get
+            // "not yet supported" (Phase 2 landing).
+            if (innerField.hasAnnotation(Id::class.java)) {
+                messages.error(
+                    "@Embedded '$fieldName': @Id on inner field '$innerFieldName' is not allowed. " +
+                            "Only @Entity classes have an ID column; the owning entity already has one.",
+                    innerField
+                )
+                return -1
+            }
+            if (innerField.hasAnnotation(Index::class.java) || innerField.hasAnnotation(HnswIndex::class.java)) {
+                messages.error(
+                    "@Embedded '$fieldName': @Index on inner field '$innerFieldName' is not yet supported. " +
+                            "To index the flattened property directly in the entity, add a duplicate " +
+                            "property on the entity (or wait for @Embedded @Index passthrough support).",
+                    innerField
+                )
+                return -1
+            }
+            if (innerField.hasAnnotation(Unique::class.java)) {
+                messages.error(
+                    "@Embedded '$fieldName': @Unique on inner field '$innerFieldName' is not yet supported. " +
+                            "Add the unique constraint on an entity-level property instead.",
+                    innerField
+                )
+                return -1
+            }
             val innerTypeMirror = innerField.asType()
 
             // ─── R5: Relations inside @Embedded — explicit rejection ───
@@ -281,21 +396,54 @@ class Properties(
                             "Move the relation to the owning entity instead.",
                     innerField
                 )
-                return
+                return -1
             }
 
-            val innerPropertyType = typeHelper.getPropertyType(innerTypeMirror)
-            if (innerPropertyType == null) {
-                // Only directly-supported types inside embedded containers — no @Convert on
-                // inner fields (M1 scope). Users needing custom types should wrap them on the
-                // ENTITY level with @Convert, not inside the embedded POJO.
-                messages.error(
-                    "@Embedded '$fieldName' inner field '$innerFieldName' has unsupported type " +
-                            "'$innerTypeMirror'. Only types directly supported by ObjectBox are allowed " +
-                            "inside an @Embedded container (no @Convert on inner fields yet).",
-                    innerField
-                )
-                return
+            // ─── P2.2: @Convert on inner field — resolve type from annotation's dbType ───
+            // When @Convert is present, the synthetic property's PropertyType comes from the
+            // annotation's dbType (e.g. String.class), NOT the inner field's Java type (e.g.
+            // java.util.UUID). The field's Java type becomes `customType`. The downstream
+            // machinery — cursor.ftl's converter-instance emission, PropertyCollector's
+            // getDatabaseValueExpression() wrap, Entity.init2ndPass()'s import handling —
+            // all key off `customType != null` on ANY property in entity.properties.
+            // Synthetic embedded props are in that list. So everything composes for free
+            // once we set customType/converter here.
+            //
+            // Mirror-based extraction because converter/dbType are Class<?> members —
+            // direct getAnnotation() would throw MirroredTypeException. Pattern mirrored
+            // from customPropertyBuilderOrNull().
+            var convertCustomType: String? = null
+            var convertConverter: String? = null
+            val convertMirror = getAnnotationMirror(innerField, Convert::class.java)
+            val innerPropertyType: PropertyType
+            if (convertMirror != null) {
+                val converter = getAnnotationValueType(convertMirror, "converter")!!
+                val dbType = getAnnotationValueType(convertMirror, "dbType")!!
+                val dbPropertyType = typeHelper.getPropertyType(dbType)
+                if (dbPropertyType == null) {
+                    messages.error(
+                        "@Embedded '$fieldName' inner field '$innerFieldName': @Convert dbType '$dbType' " +
+                                "is not a supported ObjectBox type. Use a Java primitive wrapper class.",
+                        innerField
+                    )
+                    return -1
+                }
+                innerPropertyType = dbPropertyType
+                // Erase parameterised types (e.g. List<Thing> → java.util.List) for customType.
+                convertCustomType = typeUtils.erasure(innerTypeMirror).toString()
+                convertConverter = converter.toString()
+            } else {
+                // Non-@Convert path: type derived directly from the inner field's Java type.
+                val resolved = typeHelper.getPropertyType(innerTypeMirror)
+                if (resolved == null) {
+                    messages.error(
+                        "@Embedded '$fieldName' inner field '$innerFieldName' has unsupported type " +
+                                "'$innerTypeMirror'. Use an ObjectBox-supported type or add @Convert.",
+                        innerField
+                    )
+                    return -1
+                }
+                innerPropertyType = resolved
             }
 
             val syntheticName = embedded.syntheticNameFor(innerFieldName)
@@ -311,11 +459,17 @@ class Properties(
                             "(from '$fieldName.$innerFieldName'): ${e.message}",
                     field
                 )
-                return
+                return -1
             }
 
             // ─── Set flags mirroring supportedPropertyBuilderOrNull() — ───
             // the INNER field's type determines nullability/primitiveness, not the container.
+            // For @Convert, these predicates operate on the FIELD type (e.g. UUID → not
+            // primitive) which is correct: a @Convert property is never typeNotNull at the
+            // DB layer even if dbType is a primitive wrapper (customPropertyBuilderOrNull()
+            // never calls typeNotNull either). The nonPrimitiveFlag branch below also
+            // happens not to fire for e.g. dbType=String (String.isScalar == false), so
+            // we add it explicitly for the @Convert case right after.
             val innerIsPrimitive = innerTypeMirror.kind.isPrimitive
             if (!innerIsPrimitive && (innerPropertyType.isScalar || typeHelper.isStringList(innerTypeMirror))) {
                 builder.nonPrimitiveFlag()
@@ -325,6 +479,42 @@ class Properties(
             }
             if (innerIsPrimitive) {
                 builder.typeNotNull()
+            }
+
+            // ─── P2.2: Apply @Convert metadata captured above ───
+            // customType() MUST be called BEFORE nonPrimitiveFlag(): the builder's
+            // nonPrimitiveFlag() check at Property.java:123-128 throws if called on a
+            // non-scalar type unless customType is already set (the "custom type is
+            // inherently nullable" escape hatch). Order mirrors customPropertyBuilderOrNull().
+            if (convertCustomType != null) {
+                builder.customType(convertCustomType, convertConverter)
+                builder.nonPrimitiveFlag()
+            }
+
+            // ─── P2.1: @NameInDb / @Uid passthrough from inner field ───
+            // Both annotations modulate the SYNTHETIC property's DB-side identity:
+            //   @NameInDb → overrides the column name (what model.json's "name" becomes).
+            //     Used verbatim — we do NOT re-apply the container prefix to the user's
+            //     explicit override. If the same @Embedded type is used twice and the inner
+            //     @NameInDb collides, trackUniqueName() fails loudly (that's the user's
+            //     explicit choice — what-you-write-is-what-you-get).
+            //   @Uid → pins the column's UID for schema migration stability. Lets users
+            //     rename Money.currency → Money.isoCode without IdSync treating it as a
+            //     drop-and-recreate.
+            // Pattern mirrored exactly from parseField()'s handling at lines ~585-618.
+            val nameInDbAnnotation = innerField.getAnnotation(NameInDb::class.java)
+            if (nameInDbAnnotation != null) {
+                val dbName = nameInDbAnnotation.value
+                if (dbName.isNotEmpty()) {
+                    builder.dbName(dbName)
+                }
+            }
+            val uidAnnotation = innerField.getAnnotation(Uid::class.java)
+            if (uidAnnotation != null) {
+                // 0L sentinel → -1 → IdSync prints current UID and fails (the "what's my UID?"
+                // workflow). Same semantics as regular properties.
+                val uid = if (uidAnnotation.value == 0L) -1 else uidAnnotation.value
+                builder.modelId(IdUid(0, uid))
             }
 
             // ─── Embedded-origin metadata for M2 codegen ───
@@ -343,7 +533,9 @@ class Properties(
                         "(all fields are static, transient, or @Transient).",
                 field
             )
+            return -1
         }
+        return producedCount
     }
 
     /**

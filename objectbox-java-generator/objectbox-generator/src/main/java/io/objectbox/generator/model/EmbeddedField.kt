@@ -55,13 +55,22 @@ import io.objectbox.generator.TextUtil
  *   `@Embedded.USE_FIELD_NAME`). Empty string means "no prefix at all".
  * @param typeFullyQualifiedName e.g. `com.example.Money`; used for imports in generated code
  * @param typeSimpleName e.g. `Money`; used for local var declarations in generated code
+ * @param parent the enclosing [EmbeddedField] if this is a **nested** `@Embedded`
+ *   (e.g. `Money.cur` when `Money` is itself `@Embedded`-annotated in the entity). `null`
+ *   for top-level embeds reachable directly from the entity. Used to derive path-qualified
+ *   [localVarName]s and chained-hoist right-hand-sides ([hoistRhsExpression]) — see those
+ *   for why a flat parent-ref beats a nested-list structure (the codegen needs to iterate
+ *   ALL embeds in declaration order regardless of depth; the entity's
+ *   [Entity.getEmbeddedFields] list is flat and depth-first ordered, and each entry
+ *   self-describes its nesting via this reference).
  */
 class EmbeddedField(
     val name: String,
     val isFieldAccessible: Boolean,
     val prefix: String,
     val typeFullyQualifiedName: String,
-    val typeSimpleName: String
+    val typeSimpleName: String,
+    val parent: EmbeddedField? = null
 ) : HasParsedElement {
 
     /**
@@ -96,9 +105,20 @@ class EmbeddedField(
     /**
      * Local variable name used in generated `put()` body to hold the hoisted container reference.
      *
-     * Pattern: `__emb_<name>` — follows the generator's double-underscore convention for
-     * internals (`__id`, `__assignedId`) and is distinct from any user field (Java identifiers
-     * can't start with `__emb_` and still collide with a user's `price` field).
+     * **Root embed** (`parent == null`): `__emb_<name>` — follows the generator's
+     * double-underscore convention for internals (`__id`, `__assignedId`) and is distinct
+     * from any user field (Java identifiers can't start with `__emb_` and still collide with
+     * a user's `price` field).
+     *
+     * **Nested embed**: `<parent.localVarName>_<name>` — path-qualified to keep the local
+     * unique even when two nested containers at different depths share a simple name (e.g.
+     * `Bill { @Embedded Money price }`, `Money { @Embedded Currency cur }`,
+     * `OtherEntity { @Embedded Currency cur }` — the first `cur` becomes `__emb_price_cur`,
+     * the second `__emb_cur`; without path-qualification both would be `__emb_cur` and
+     * PropertyCollector's hoist loop would emit a Java-level duplicate-local compile error).
+     *
+     * The recursion bottoms out at the root's fixed `__emb_` prefix, so the name is always
+     * deterministic and grep-friendly (every hoisted embedded local starts with `__emb_`).
      *
      * Hoisting once per container (rather than `entity.price` inline at each use site) avoids
      * repeated `entity.price != null` evaluations and — critically — ensures the null-guard
@@ -106,7 +126,43 @@ class EmbeddedField(
      * (unlikely inside a sync `put()`, but correctness-by-construction).
      */
     val localVarName: String
-        get() = "__emb_$name"
+        get() = (parent?.localVarName ?: "__emb") + "_" + name
+
+    /**
+     * Right-hand-side expression for the hoist declaration `<Type> <localVarName> = <RHS>;`
+     * in the generated `put()` body.
+     *
+     * **Root embed** (`parent == null`): `<entityRef>.<containerValueExpression>` —
+     * straightforward field/getter read from the entity. E.g. `entity.price`.
+     *
+     * **Nested embed**: chains from the **parent's** already-hoisted local with a null-guard:
+     * `<parent.localVarName> != null ? <parent.localVarName>.<containerValueExpression> : null`.
+     * E.g. `__emb_price != null ? __emb_price.cur : null`.
+     *
+     * This chaining is why the entity's flat embedded-fields list MUST be in depth-first
+     * (parent-before-child) order — each nested hoist reads from a local that must already
+     * be declared. [Entity.addEmbedded] + the processor's recursion naturally enforce this:
+     * the parent is added BEFORE the inner-field walk that discovers the nested child.
+     *
+     * The null-propagation ensures a null outer container flows down as null to ALL nested
+     * levels without NPE — and the per-property null-guard in PropertyCollector's
+     * appendProperty() (which keys off `<origin.localVarName> != null`) then correctly
+     * writes the leaf as absent/null/0 without ever dereferencing the missing container.
+     *
+     * @param entityRef the Java variable name for the entity in scope (always `"entity"`
+     *   in the current cursor.ftl / PropertyCollector setup — parameterised here to keep
+     *   the model class template-agnostic).
+     */
+    fun hoistRhsExpression(entityRef: String): String {
+        return if (parent == null) {
+            "$entityRef.$containerValueExpression"
+        } else {
+            // Cache parent local var name — used twice (guard + deref), keeps it readable
+            // and avoids two walks up the parent chain.
+            val parentLocal = parent.localVarName
+            "$parentLocal != null ? $parentLocal.$containerValueExpression : null"
+        }
+    }
 
     /**
      * Registers a synthetic property as produced by this embedded field.

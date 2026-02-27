@@ -91,13 +91,19 @@ class PropertyCollector {
         //   (c) gives appendProperty() a stable name (`__emb_<name>`) to reference
         //       regardless of which collect-call iteration consumes the property.
         //
-        // Example:  Money __emb_price = entity.price;
-        //           Money __emb_source = entity.source;
+        // Root example:    Money __emb_price = entity.price;
+        // Nested example:  Currency __emb_price_cur = __emb_price != null ? __emb_price.cur : null;
+        //
+        // The RHS is fully encapsulated by EmbeddedField.hoistRhsExpression() — for a root
+        // embed it's the simple entity dereference; for a nested one it chains from the
+        // parent's already-declared local with null-propagation. Iteration order (flat,
+        // depth-first parent-before-child — guaranteed by the processor's add-before-recurse)
+        // means every parent local is already in scope when its child's hoist references it.
         for (EmbeddedField emb : embeddedFields) {
             all.append(INDENT)
                .append(emb.getTypeSimpleName()).append(' ')
-               .append(emb.getLocalVarName()).append(" = entity.")
-               .append(emb.getContainerValueExpression()).append(";\n");
+               .append(emb.getLocalVarName()).append(" = ")
+               .append(emb.hoistRhsExpression("entity")).append(";\n");
         }
         if (!embeddedFields.isEmpty()) {
             all.append('\n'); // blank line separating hoisting from collect calls (cosmetic)

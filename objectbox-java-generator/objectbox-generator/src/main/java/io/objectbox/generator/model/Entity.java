@@ -203,16 +203,34 @@ public class Entity implements HasParsedElement {
     /**
      * Registers an {@code @Embedded} container field.
      * <p>
-     * The container's {@link EmbeddedField#getName() name} is tracked in the entity's unique-name
-     * set — a subsequent {@link #addProperty} or {@link #addToOne}/{@link #addToMany} with the same
-     * name will throw. The synthetic flattened properties produced by this container should be added
-     * separately via {@link #addProperty} (each with its own prefixed name), then linked back via
-     * {@link EmbeddedField#addProperty}.
+     * For a <b>root</b> container (one directly on this entity — no {@link EmbeddedField#getParent()
+     * parent}), the container's {@link EmbeddedField#getName() name} is tracked in the entity's
+     * unique-name set — a subsequent {@link #addProperty} or {@link #addToOne}/{@link #addToMany}
+     * with the same name will throw. This prevents e.g. {@code @Embedded Money price} colliding
+     * with a regular {@code String price} field on the same entity.
+     * <p>
+     * For a <b>nested</b> container (one living on an intermediate embedded type, not on this
+     * entity), name tracking is <b>skipped</b> — the nested container's simple name (e.g.
+     * {@code cur} for {@code Money.cur}) has no meaning in this entity's namespace. A user's
+     * own {@code Bill.cur} field is entirely unrelated and must not false-collide. Nested
+     * containers still land in {@link #getEmbeddedFields()} (the codegen hoist loop needs them
+     * all, flat), but their names belong to their parent type's scope, not this entity's.
+     * <p>
+     * The synthetic flattened properties produced by this container should be added separately
+     * via {@link #addProperty} (each with its own prefixed name), then linked back via
+     * {@link EmbeddedField#addProperty}. Those synthetic names ARE entity-scoped (they become
+     * transformer-injected fields) and ARE tracked by {@link #addProperty}'s own call to
+     * {@link #trackUniqueName}.
      *
-     * @throws ModelException if another property, relation, or embedded field already uses this name.
+     * @throws ModelException if (root container only) another property, relation, or embedded
+     *   field already uses this name.
      */
     public Entity addEmbedded(EmbeddedField embedded) throws ModelException {
-        trackUniqueName(names, embedded.getName(), embedded);
+        if (embedded.getParent() == null) {
+            // Root container: its name IS a Java field on this entity — reserve it.
+            trackUniqueName(names, embedded.getName(), embedded);
+        }
+        // else nested: name lives in the parent type's scope, not this entity's. Don't reserve.
         embeddedFields.add(embedded);
         return this;
     }
@@ -433,8 +451,15 @@ public class Entity implements HasParsedElement {
             trackUniqueName(names, toMany.getName(), toMany);
         }
         for (EmbeddedField embedded : embeddedFields) {
-            // The container name itself occupies a slot in the entity's Java namespace (it IS a field),
-            // even though it has no DB column. Prevents e.g. a regular property shadowing the container.
+            // A ROOT container's name occupies a slot in the entity's Java namespace (it IS a
+            // field on this class), even though it has no DB column. Prevents e.g. a regular
+            // property shadowing the container.
+            //
+            // A NESTED container's name does NOT — it's a field on an intermediate embedded
+            // type (e.g. Money.cur when Money is itself @Embedded in this entity). Its name
+            // has no meaning in this entity's namespace; a user's own Bill.cur property is
+            // unrelated. Same guard as addEmbedded() — see P2.4.
+            if (embedded.getParent() != null) continue;
             trackUniqueName(names, embedded.getName(), embedded);
         }
     }
